@@ -13,7 +13,7 @@ from occlusion_association.config import load_config
 from occlusion_association.dataset import DAVISDataset
 from occlusion_association.experiments import run_experiment_suite
 from occlusion_association.feature_cache import FeatureCache
-from occlusion_association.features import build_preprocessing_descriptor
+from occlusion_association.features import build_preprocessing_descriptor, source_content_digests
 from occlusion_association.result_io import export_experiment_results
 
 
@@ -48,24 +48,29 @@ def test_tiny_synthetic_end_to_end_experiment_runs_without_dataset_or_gpu(
     dataset = create_synthetic_davis(tmp_path / "DAVIS")
     cache = FeatureCache(config["features"]["cache_dir"])
     backbone = f"{config['features']['torch_hub_repository']}:{config['features']['backbone']}"
+    model_revision = "synthetic-checkpoint-v1"
+    cache.record_model_revision(backbone, model_revision)
     preprocessing = build_preprocessing_descriptor(
         int(config["features"]["input_size"]),
         device=str(config["features"]["device"]),
         use_mixed_precision=bool(config["features"]["use_mixed_precision"]),
     )
     for sequence_name in dataset.sequence_names:
-        for frame_index in range(2):
-            frame_name = f"{frame_index:05d}"
+        for frame in dataset.iter_frames(sequence_name):
+            image_digest, mask_digest = source_content_digests(frame.image, frame.mask)
             for object_id, vector in (
                 (1, np.array([1.0, 0.0], dtype=np.float32)),
                 (2, np.array([0.0, 1.0], dtype=np.float32)),
             ):
                 key = cache.make_key(
                     sequence=sequence_name,
-                    frame=frame_name,
+                    frame=frame.frame_name,
                     object_id=object_id,
                     backbone=backbone,
                     preprocessing=preprocessing,
+                    model_revision=model_revision,
+                    source_image_digest=image_digest,
+                    source_mask_digest=mask_digest,
                 )
                 cache.put(key, vector)
 
@@ -104,11 +109,29 @@ def test_tiny_synthetic_end_to_end_experiment_runs_without_dataset_or_gpu(
     assert len(result["appearance_ablation"]) == 3
     assert [row["max_memory_gap"] for row in result["memory_duration_ablation"]] == [5, 30]
     assert result["calibration_metrics"]["n_candidates"] == 4
+    assert result["calibration_metrics"]["evaluation_sequences"] == ["validation_sequence"]
+    assert "brier_score" in result["calibration_metrics"]
+    assert "ece" in result["calibration_metrics"]
+    assert result["precision_coverage_curve_level"] == "candidate_pair"
+    assert result["assignment_precision_coverage_curve"]
+    assert any(
+        row["outcome"] == "no_candidate" for row in result["detection_decisions"]
+    )
+    assert all("pair_outcome" in row for row in result["association_predictions"])
+    calibrated_rows = [
+        row for row in result["per_sequence_metrics"]
+        if row["method"] == "calibrated_selective"
+    ]
+    assert calibrated_rows[0]["calibration_candidate_pairs"] == 4
+    assert "brier_score" in calibrated_rows[0]
     assert result["sequence_split"] == {
         "train": ["train_sequence"],
         "validation": ["validation_sequence"],
     }
     assert result["calibrator"].metadata["validation_sequences_used_for_fit"] == []
+    assert result["calibrator"].metadata["candidate_generation_policy"].startswith(
+        "cosine_threshold;"
+    )
 
     output = tmp_path / "synthetic_experiment"
     export_experiment_results(result, output, make_plots=True)
@@ -116,8 +139,29 @@ def test_tiny_synthetic_end_to_end_experiment_runs_without_dataset_or_gpu(
     assert (output / "metrics.csv").is_file()
     assert (output / "per_sequence_metrics.csv").is_file()
     assert (output / "association_predictions.csv").is_file()
+    assert (output / "detection_decisions.csv").is_file()
     assert (output / "training_calibration_candidates.csv").is_file()
+    assert (output / "assignment_precision_coverage_curve.csv").is_file()
     assert (output / "calibrator.joblib").is_file()
     assert (output / "experiment_summary.md").is_file()
     assert (output / "figures" / "reliability_diagram.png").is_file()
     assert (output / "figures" / "identity_switches.pdf").is_file()
+
+
+def test_experiment_runner_rejects_validation_sequences_as_calibration_training(
+    tmp_path: Path,
+) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    config = load_config(repository_root / "configs" / "default.yaml").to_dict()
+    dataset = create_synthetic_davis(tmp_path / "DAVIS")
+
+    import pytest
+
+    with pytest.raises(ValueError, match="official training split"):
+        run_experiment_suite(
+            dataset,
+            FeatureCache(tmp_path / "unused_cache"),
+            config,
+            train_sequence_names=["validation_sequence"],
+            validation_sequence_names=[],
+        )

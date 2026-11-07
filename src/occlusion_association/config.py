@@ -115,6 +115,15 @@ def load_config(
         raise ConfigError("memory.max_gap must be a positive integer")
     if int(loaded["evaluation"].get("ece_bins", 0)) < 1:
         raise ConfigError("evaluation.ece_bins must be a positive integer")
+    class_weight = loaded["calibration"].get("class_weight")
+    if (
+        class_weight is not None
+        and class_weight != "balanced"
+        and not isinstance(class_weight, dict)
+    ):
+        raise ConfigError(
+            "calibration.class_weight must be null, 'balanced', or a class-weight mapping"
+        )
 
     return ProjectConfig(
         **{name: loaded[name] for name in _SECTION_NAMES},

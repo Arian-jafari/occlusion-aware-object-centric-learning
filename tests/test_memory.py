@@ -37,6 +37,27 @@ def test_memory_creates_updates_and_tracks_appearance_history() -> None:
     assert identity.previous_center == (6.0, 5.0)
     assert len(identity.appearance_history) == 2
     np.testing.assert_allclose(np.linalg.norm(identity.appearance_embedding), 1.0)
+    np.testing.assert_allclose(
+        identity.appearance_embedding,
+        np.array([0.9, 0.3], dtype=np.float32) / np.linalg.norm([0.9, 0.3]),
+    )
+
+
+def test_appearance_prototype_uses_only_the_bounded_recent_history() -> None:
+    memory = ObjectMemory(max_gap=5, appearance_history_size=2)
+    memory.advance_to(0)
+    predicted_id = memory.create_identity(detection(embedding=(1.0, 0.0)), 0)
+    memory.advance_to(1)
+    memory.update_identity(predicted_id, detection(embedding=(0.0, 1.0)), 1)
+    memory.advance_to(2)
+    memory.update_identity(predicted_id, detection(embedding=(-1.0, 0.0)), 2)
+
+    identity = memory.get(predicted_id)
+    assert len(identity.appearance_history) == 2
+    np.testing.assert_allclose(
+        identity.appearance_embedding,
+        np.array([-1.0, 1.0], dtype=np.float32) / np.sqrt(2.0),
+    )
 
 
 def test_memory_retains_configured_missing_gap_then_expires() -> None:

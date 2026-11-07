@@ -12,7 +12,7 @@ from .object_representation import ObjectDetection
 
 @dataclass
 class IdentityMemory:
-    """Appearance and last observed geometry for one predicted identity."""
+    """Historical appearance prototype and last observed geometry."""
 
     predicted_identity_id: int
     appearance_embedding: np.ndarray
@@ -95,6 +95,17 @@ class ObjectMemory:
             raise ValueError("Detection embedding must have nonzero norm")
         return (embedding / norm).astype(np.float32)
 
+    @staticmethod
+    def _history_prototype(history: deque[np.ndarray]) -> np.ndarray:
+        """Return the L2-normalized mean of the bounded normalized history."""
+
+        vectors = np.stack(tuple(history)).astype(np.float32)
+        mean = vectors.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm <= 1e-12:
+            return vectors[-1].copy()
+        return (mean / norm).astype(np.float32)
+
     def create_identity(self, detection: ObjectDetection, frame_index: int | None = None) -> int:
         """Create a new predicted identity for an unmatched detection."""
 
@@ -110,7 +121,7 @@ class ObjectMemory:
         history.append(embedding.copy())
         self._identities[identity_id] = IdentityMemory(
             predicted_identity_id=identity_id,
-            appearance_embedding=embedding,
+            appearance_embedding=self._history_prototype(history),
             previous_center=tuple(map(float, detection.center)),
             previous_bbox=tuple(map(float, detection.bbox)),
             previous_area=int(detection.area),
@@ -136,11 +147,11 @@ class ObjectMemory:
             raise ValueError("Identities must be updated on the current memory frame")
         identity = self._identities[predicted_identity_id]
         embedding = self._normalized_embedding(detection)
-        identity.appearance_embedding = embedding
+        identity.appearance_history.append(embedding.copy())
+        identity.appearance_embedding = self._history_prototype(identity.appearance_history)
         identity.previous_center = tuple(map(float, detection.center))
         identity.previous_bbox = tuple(map(float, detection.bbox))
         identity.previous_area = int(detection.area)
         identity.previous_observation_frame = frame
         identity.frames_since_last_observation = 0
         identity.missing_frames = 0
-        identity.appearance_history.append(embedding.copy())

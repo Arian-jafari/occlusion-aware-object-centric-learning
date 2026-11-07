@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import islice
@@ -19,6 +21,7 @@ class SpatialFeatureExtractor(Protocol):
     """Minimal interface needed by the object feature extraction pipeline."""
 
     backbone_name: str
+    model_revision: str
     patch_size: int
     preprocessing: dict[str, Any]
 
@@ -109,6 +112,7 @@ class DINOv2FeatureExtractor:
                     f"Could not load official DINOv2 model {repository}:{backbone_name}. "
                     "Check Colab network access or the Torch Hub cache."
                 ) from exc
+        self.model_revision = _model_state_revision(model, torch)
         self.model = model.to(self.device)
         self.model.eval()
         for parameter in self.model.parameters():
@@ -201,6 +205,44 @@ class _NullContext:
         return False
 
 
+def _model_state_revision(model: Any, torch: Any) -> str:
+    """Hash the exact model state used to produce cached embeddings."""
+
+    digest = hashlib.sha256()
+    for name, value in sorted(model.state_dict().items()):
+        tensor = value.detach().to(device="cpu").contiguous()
+        descriptor = {
+            "name": str(name),
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+        }
+        digest.update(json.dumps(descriptor, sort_keys=True).encode("utf-8"))
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return f"sha256:{digest.hexdigest()}"
+
+
+def source_content_digests(image: Image.Image, mask: np.ndarray) -> tuple[str, str]:
+    """Hash the decoded RGB image and exact mask array independently."""
+
+    rgb = image.convert("RGB")
+    image_digest = hashlib.sha256()
+    image_digest.update(
+        json.dumps({"mode": "RGB", "size": list(rgb.size)}, sort_keys=True).encode("utf-8")
+    )
+    image_digest.update(rgb.tobytes())
+
+    source_mask = np.ascontiguousarray(mask)
+    mask_digest = hashlib.sha256()
+    mask_digest.update(
+        json.dumps(
+            {"dtype": str(source_mask.dtype), "shape": list(source_mask.shape)},
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    mask_digest.update(source_mask.tobytes())
+    return image_digest.hexdigest(), mask_digest.hexdigest()
+
+
 def make_object_feature_cache_key(
     cache: FeatureCache,
     *,
@@ -209,6 +251,9 @@ def make_object_feature_cache_key(
     object_id: int,
     backbone_name: str,
     preprocessing: dict[str, Any],
+    model_revision: str | None = None,
+    source_image_digest: str | None = None,
+    source_mask_digest: str | None = None,
 ) -> dict[str, Any]:
     return cache.make_key(
         sequence=sequence,
@@ -216,6 +261,9 @@ def make_object_feature_cache_key(
         object_id=object_id,
         backbone=backbone_name,
         preprocessing=preprocessing,
+        model_revision=model_revision,
+        source_image_digest=source_image_digest,
+        source_mask_digest=source_mask_digest,
     )
 
 
@@ -225,11 +273,18 @@ def load_cached_frame_embeddings(
     *,
     backbone_name: str,
     preprocessing: dict[str, Any],
+    model_revision: str | None = None,
 ) -> tuple[dict[int, np.ndarray], list[int]]:
     """Load cached embeddings by mask label and return missing object labels."""
 
     embeddings: dict[int, np.ndarray] = {}
     missing: list[int] = []
+    image_digest, mask_digest = source_content_digests(frame.image, frame.mask)
+    revision = model_revision or cache.model_revision_for(backbone_name)
+    if revision is None:
+        raise ValueError(
+            f"No checkpoint fingerprint is recorded for {backbone_name}; run feature extraction first"
+        )
     for object_id in object_ids_from_mask(frame.mask):
         key = make_object_feature_cache_key(
             cache,
@@ -238,6 +293,9 @@ def load_cached_frame_embeddings(
             object_id=object_id,
             backbone_name=backbone_name,
             preprocessing=preprocessing,
+            model_revision=revision,
+            source_image_digest=image_digest,
+            source_mask_digest=mask_digest,
         )
         embedding = cache.get(key)
         if embedding is None:
@@ -263,14 +321,20 @@ def extract_sequence_features(
 
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
-    jobs: list[tuple[FrameData, list[int]]] = []
+    jobs: list[tuple[FrameData, list[int], str, str]] = []
     requested = 0
     cache_hits = 0
     invalid: list[dict[str, Any]] = []
+    model_revision = getattr(extractor, "model_revision", None)
+    if not model_revision:
+        raise ValueError("Feature extractor must expose an exact model_revision fingerprint")
+    model_revision = str(model_revision)
+    cache.record_model_revision(extractor.backbone_name, model_revision)
     for frame in sequence.frames:
         object_ids = object_ids_from_mask(frame.mask)
         requested += len(object_ids)
         missing = []
+        image_digest, mask_digest = source_content_digests(frame.image, frame.mask)
         for object_id in object_ids:
             key = make_object_feature_cache_key(
                 cache,
@@ -279,21 +343,26 @@ def extract_sequence_features(
                 object_id=object_id,
                 backbone_name=extractor.backbone_name,
                 preprocessing=extractor.preprocessing,
+                model_revision=model_revision,
+                source_image_digest=image_digest,
+                source_mask_digest=mask_digest,
             )
             if cache.get(key) is None:
                 missing.append(object_id)
             else:
                 cache_hits += 1
         if missing:
-            jobs.append((frame, missing))
+            jobs.append((frame, missing, image_digest, mask_digest))
 
     features_written = 0
     for start in range(0, len(jobs), batch_size):
         batch_jobs = jobs[start : start + batch_size]
-        extracted = extractor.extract_patch_tokens([frame.image for frame, _ in batch_jobs])
+        extracted = extractor.extract_patch_tokens([frame.image for frame, _, _, _ in batch_jobs])
         if len(extracted) != len(batch_jobs):
             raise RuntimeError("Feature extractor returned a different number of results than inputs")
-        for (frame, object_ids), (tokens, resized_size) in zip(batch_jobs, extracted):
+        for (frame, object_ids, image_digest, mask_digest), (tokens, resized_size) in zip(
+            batch_jobs, extracted
+        ):
             for object_id in object_ids:
                 embedding = pool_patch_features(
                     tokens,
@@ -312,6 +381,9 @@ def extract_sequence_features(
                         object_id=object_id,
                         backbone_name=extractor.backbone_name,
                         preprocessing=extractor.preprocessing,
+                        model_revision=model_revision,
+                        source_image_digest=image_digest,
+                        source_mask_digest=mask_digest,
                     ),
                     embedding,
                 )

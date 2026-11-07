@@ -3,11 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from occlusion_association.dataset import FrameData, SequenceData
 from occlusion_association.feature_cache import FeatureCache
-from occlusion_association.features import extract_sequence_features
+from occlusion_association.features import extract_sequence_features, source_content_digests
 from occlusion_association.features import build_preprocessing_descriptor
 from occlusion_association.object_representation import (
     object_ids_from_mask,
@@ -61,6 +62,9 @@ def test_cache_key_changes_with_preprocessing_and_round_trips(tmp_path: Path) ->
         object_id=2,
         backbone="repo:model",
         preprocessing={"input_size": 518},
+        model_revision="checkpoint-a",
+        source_image_digest="image-a",
+        source_mask_digest="mask-a",
     )
     changed_key = cache.make_key(
         sequence="seq",
@@ -68,6 +72,9 @@ def test_cache_key_changes_with_preprocessing_and_round_trips(tmp_path: Path) ->
         object_id=2,
         backbone="repo:model",
         preprocessing={"input_size": 392},
+        model_revision="checkpoint-a",
+        source_image_digest="image-a",
+        source_mask_digest="mask-a",
     )
     vector = np.array([0.6, 0.8], dtype=np.float32)
 
@@ -76,6 +83,18 @@ def test_cache_key_changes_with_preprocessing_and_round_trips(tmp_path: Path) ->
     np.testing.assert_allclose(cache.get(key), vector)
     assert cache.get(changed_key) is None
     assert path.is_file()
+
+
+def test_cache_keys_reject_missing_model_or_source_fingerprints(tmp_path: Path) -> None:
+    cache = FeatureCache(tmp_path)
+    with pytest.raises(ValueError, match="require exact model and source fingerprints"):
+        cache.make_key(
+            sequence="seq",
+            frame="00001",
+            object_id=2,
+            backbone="repo:model",
+            preprocessing={"input_size": 518},
+        )
 
 
 def test_preprocessing_descriptor_invalidates_device_precision_changes() -> None:
@@ -94,6 +113,7 @@ def test_preprocessing_descriptor_invalidates_device_precision_changes() -> None
 
 class _FakeSpatialExtractor:
     backbone_name = "test:spatial"
+    model_revision = "test-checkpoint-1"
     patch_size = 14
     preprocessing = {"test_resolution": 14}
 
@@ -137,6 +157,58 @@ def test_sequence_extraction_caches_each_object_embedding(tmp_path: Path) -> Non
     assert extractor.calls == 1
 
 
+def test_sequence_cache_invalidates_source_contents_and_model_revision(tmp_path: Path) -> None:
+    image = Image.new("RGB", (14, 14), (40, 80, 120))
+    mask = np.zeros((14, 14), dtype=np.uint8)
+    mask[:, :7] = 1
+    mask[:, 7:] = 2
+    frame = FrameData(
+        sequence="seq",
+        frame_name="00000",
+        image=image,
+        mask=mask,
+        object_ids=(1, 2),
+        image_path=tmp_path / "00000.jpg",
+        annotation_path=tmp_path / "00000.png",
+    )
+    sequence = SequenceData(name="seq", frames=[frame])
+    extractor = _FakeSpatialExtractor()
+    cache = FeatureCache(tmp_path / "features")
+
+    assert extract_sequence_features(sequence, extractor, cache).features_written == 2
+    assert extract_sequence_features(sequence, extractor, cache).cache_hits == 2
+
+    frame.image.putpixel((0, 0), (200, 80, 120))
+    changed_image = extract_sequence_features(sequence, extractor, cache)
+    assert changed_image.features_written == 2
+    assert changed_image.cache_hits == 0
+
+    frame.mask = np.fliplr(frame.mask).copy()
+    changed_mask = extract_sequence_features(sequence, extractor, cache)
+    assert changed_mask.features_written == 2
+    assert changed_mask.cache_hits == 0
+
+    extractor.model_revision = "test-checkpoint-2"
+    changed_checkpoint = extract_sequence_features(sequence, extractor, cache)
+    assert changed_checkpoint.features_written == 2
+    assert changed_checkpoint.cache_hits == 0
+    assert cache.model_revision_for(extractor.backbone_name) == "test-checkpoint-2"
+
+
+def test_source_digests_distinguish_image_and_mask_content() -> None:
+    image = Image.new("RGB", (2, 2), (1, 2, 3))
+    mask = np.zeros((2, 2), dtype=np.uint8)
+    image_digest, mask_digest = source_content_digests(image, mask)
+
+    image.putpixel((0, 0), (3, 2, 1))
+    changed_image_digest, same_mask_digest = source_content_digests(image, mask)
+    changed_mask_digest = source_content_digests(image, np.ones_like(mask))[1]
+
+    assert changed_image_digest != image_digest
+    assert same_mask_digest == mask_digest
+    assert changed_mask_digest != mask_digest
+
+
 def test_dinov2_wrapper_uses_frozen_spatial_tokens_on_cpu() -> None:
     import pytest
 
@@ -168,6 +240,7 @@ def test_dinov2_wrapper_uses_frozen_spatial_tokens_on_cpu() -> None:
     tokens, resized_size = extractor.extract_patch_tokens([Image.new("RGB", (28, 28))])[0]
 
     assert extractor.device.type == "cpu"
+    assert extractor.model_revision.startswith("sha256:")
     assert model.training is False
     assert all(not parameter.requires_grad for parameter in model.parameters())
     assert tokens.shape == (2, 2, 3)

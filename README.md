@@ -1,14 +1,14 @@
 # Calibrated Selective Re-Identification for Occlusion-Robust Object-Centric Video Representations
 
-This project tests whether calibrated association confidence and selective rejection reduce identity switches when objects reappear after absence. It is an empirical investigation of object identity association under occlusion; it does not claim to solve object discovery, segmentation, or general-purpose multi-object tracking.
+This project tests whether logistic-regression association probability estimates, evaluated for calibration on held-out data, and selective rejection reduce identity switches when objects reappear after absence. It is an empirical investigation of object identity association under occlusion; it does not claim to solve object discovery, segmentation, or general-purpose multi-object tracking.
 
-The experiment uses DAVIS 2017 TrainVal 480p. Ground-truth instance masks are supplied as detections to isolate association quality from segmentation errors. The visual representation is frozen DINOv2 ViT-S/14 spatial patch features pooled inside each mask. A standardized logistic regression model estimates the probability that a memory identity and a current detection belong to the same object. The system can reject low-confidence Hungarian assignments and start a new predicted identity.
+The experiment uses DAVIS 2017 TrainVal 480p. Ground-truth instance masks are supplied as detections to isolate association quality from segmentation errors. The visual representation is frozen DINOv2 ViT-S/14 spatial patch features pooled inside each mask. An unweighted standardized logistic regression estimates the probability that a memory identity and a current detection belong to the same object. Thresholded methods can leave detections and memory tracks unmatched during assignment; unmatched candidate detections start new predicted identities.
 
 No DAVIS data, model checkpoints, extracted feature caches, or fabricated experimental results are stored in this repository.
 
 ## Research question and hypothesis
 
-**Question:** Can calibrated association confidence and selective identity assignment reduce identity switches after object absence, compared with forced cosine matching and fixed-threshold matching?
+**Question:** Can selective identity assignment using probability estimates whose calibration is evaluated on held-out data reduce identity switches after object absence, compared with forced cosine matching and fixed-threshold matching?
 
 **Hypothesis:** Allowing the association system to reject weak matches will reduce incorrect identity assignments. This may increase fragmentation, so precision, recall, coverage, identity switches, and fragmentation are reported separately.
 
@@ -36,9 +36,9 @@ The comparison includes:
 - Cosine Hungarian assignment with forced acceptance.
 - Cosine Hungarian assignment with a fixed threshold.
 - Appearance and geometry Hungarian matching with a fixed score threshold.
-- Logistic probability scores with Hungarian assignment and explicit low-confidence rejection.
+- Logistic probability scores with threshold-aware Hungarian assignment and unmatched choices.
 
-The loader requires both official train and validation lists and rejects overlapping lists. The calibrator is fit from training-sequence candidate pairs only. Validation candidate pairs are used for final calibration analysis, not to fit the model or choose the configured operating threshold.
+The loader requires both official train and validation lists, rejects overlap, and the experiment runner restricts fitting and evaluation names to their corresponding official lists. The calibrator is fit from training-sequence candidate pairs only. This repository's DAVIS TrainVal configuration has no independent labeled test split, so validation is reported as held-out validation rather than an untouched test result. Validation candidate pairs do not fit the model or select the configured operating threshold.
 
 ## Dataset
 
@@ -95,7 +95,7 @@ python scripts/extract_features.py --config configs/default.yaml --split all
 python scripts/run_experiments.py --config configs/default.yaml
 ```
 
-Features are cached by sequence, frame, object label, backbone, and preprocessing settings. Repeated extraction skips compatible cache entries; a different backbone or preprocessing configuration produces different cache keys. Experiment runs receive unique output directories by default. To intentionally replace a named result directory, pass `--experiment-name NAME --overwrite`.
+Features are cached by sequence, frame, object label, preprocessing settings, decoded source-image and mask content digests, and the exact backbone state-dict SHA-256. Extraction records the active checkpoint fingerprint in the cache directory so calibration and experiment readers use the same revision. Repeated extraction skips compatible entries; changed image/mask pixels, checkpoint weights, backbone, or preprocessing produce different keys. Caches created with the older key schema will miss and be regenerated; old files are left in place. Experiment runs receive unique output directories by default. To intentionally replace a named result directory, pass `--experiment-name NAME --overwrite`.
 
 The calibrator can also be trained and saved separately. It consumes cached **training-split** features only:
 
@@ -111,7 +111,7 @@ python scripts/summarize_results.py /path/to/results/experiment_YYYYMMDDTHHMMSSZ
 
 ## Configuration and outputs
 
-[`configs/default.yaml`](configs/default.yaml) contains the dataset root, official split names, DINOv2 backbone, preprocessing size and batch size, persistent cache path, memory gap, association thresholds and weights, logistic regression settings, ECE bins, confidence thresholds, memory-duration sweep, random seed, smoke-test limits, and output directory.
+[`configs/default.yaml`](configs/default.yaml) contains the dataset root, official split names, DINOv2 backbone, preprocessing size and batch size, persistent cache path, memory gap, association thresholds and weights, logistic regression settings (unweighted by default), ECE bins, confidence thresholds, memory-duration sweep, random seed, smoke-test limits, and output directory.
 
 Each experiment directory contains:
 
@@ -122,9 +122,12 @@ experiment_.../
 ├── metrics.csv
 ├── per_sequence_metrics.csv
 ├── association_predictions.csv
+├── detection_decisions.csv
 ├── calibration_candidates.csv
 ├── training_calibration_candidates.csv
 ├── calibration_metrics.json
+├── precision_coverage_curve.csv
+├── assignment_precision_coverage_curve.csv
 ├── calibrator.joblib
 ├── calibrator.json
 ├── appearance_ablation.csv
@@ -145,13 +148,17 @@ Metadata records the UTC run time, commit hash when available, Python/PyTorch/CU
 - **Track fragmentation:** an identity change after at least one intervening valid image/annotation frame in which the object was absent. Intervals containing missing or invalid dataset frames are not counted as natural occlusion fragmentation.
 - **Correct association:** an accepted Hungarian match whose memory identity's prior ground-truth owner equals the current detection's ground-truth label. This label is used after the decision for evaluation only.
 - **Incorrect association:** an accepted match between different ground-truth objects.
-- **Rejected association:** a Hungarian-selected assignment below that method's acceptance threshold. The detection starts a new predicted identity; the old memory remains until expiration.
+- **Rejected association (`rejected_associations`):** a detection had candidate pairs, but none met the applicable threshold. This metric counts confidence rejections only. Assignment conflicts are reported separately; both outcomes start a new predicted identity, while a detection with no candidate also starts a new ID.
+- **Confidence rejection:** a detection had candidates, but no candidate reached the method's threshold.
+- **Assignment conflict:** at least one candidate reached the threshold, but the global one-to-one assignment selected another detection for the competing identity. This is not counted as a confidence rejection.
+- **No candidate:** no active identity was available for that detection. This is reported separately and excluded from association coverage.
+- `association_predictions.csv` contains candidate-pair outcomes; `detection_decisions.csv` contains one row per detection, including detections with no candidate.
 - **Association precision:** correct accepted associations divided by all accepted associations.
 - **Association recall:** correct accepted associations divided by current object observations for which a retained memory of that same object was available at frame start.
-- **Association coverage:** accepted Hungarian assignments divided by all Hungarian-selected assignment decisions before threshold rejection. Accepted, rejected, and total assignment counts are exported.
+- **Association coverage:** accepted matches divided by detections that had at least one memory candidate. Confidence rejections and assignment conflicts are separate counts; no-candidate detections are excluded.
 - **False association rate:** incorrect accepted associations divided by all accepted associations.
-- **Brier score and ECE:** computed only for logistic model probabilities on held-out validation candidate pairs. Raw cosine is a similarity, not a probability, so it is not given Brier/ECE scores. ECE uses uniform bins, configurable with a default of 10.
-- **Precision–coverage curve:** a candidate-pair diagnostic over all held-out candidate pairs at configured probability cutoffs. It is distinct from assignment coverage above, which is calculated over Hungarian-selected decisions.
+- **Brier score and ECE:** computed only for logistic probability estimates on held-out validation candidate pairs, pooled and per sequence, with candidate-pair counts. Raw-score methods are marked not applicable, not as empty candidate data. Empty probability sets produce undefined (NaN) metrics; single-class Brier/ECE are calculable but have limited class support. No logistic probabilities are assumed calibrated. Raw cosine is a similarity, not a probability, so it is not given Brier/ECE scores.
+- **Precision–coverage curves:** the candidate-pair curve thresholds pair predictions independently. A separate assignment-level curve reruns one-to-one Hungarian assignment at each cutoff. Neither is a replacement for tracking metrics.
 - **Natural occlusion gaps:** identity consistency between observations when every intervening frame has a valid annotation. No artificial observation removal is performed in this version.
 
 IDF1 and HOTA are omitted because the project does not include a validated implementation for the oracle-mask association protocol. It does not report approximate values under those names.
@@ -169,7 +176,7 @@ The following is an empty reporting template, not an experimental result:
 
 ## Reproducibility
 
-Python, NumPy, PyTorch, and CUDA seeds are set from the central configuration. Logistic regression also receives an explicit scikit-learn `random_state`. Training candidate pairs are generated from online forced-cosine memories over training sequences; validation sequence names are checked against the training set before fitting. Validation threshold sweeps are diagnostics only. The configured operating threshold is fixed independently of validation results.
+Python, NumPy, PyTorch, and CUDA seeds are set from the central configuration. Logistic regression also receives an explicit scikit-learn `random_state`. Training candidate pairs use thresholded-cosine memory replay on training sequences to include rejection-induced new identities. Selective inference uses probability thresholds and can still produce different memory states when geometric features affect decisions; this remaining train/inference shift is documented. Brier score and ECE are evaluated on held-out validation pairs. Validation threshold sweeps are diagnostics only. The configured operating threshold is fixed independently of validation results.
 
 The current project includes a CPU-compatible synthetic end-to-end experiment that requires neither DAVIS nor a pretrained model. Run it with:
 

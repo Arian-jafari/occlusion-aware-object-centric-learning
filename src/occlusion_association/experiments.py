@@ -19,6 +19,7 @@ from .calibration import (
 from .dataset import DAVISDataset, DatasetIssue, FrameData
 from .evaluation import (
     FrameEvaluationLog,
+    assignment_precision_coverage_curve,
     calibration_metrics,
     candidate_targets_and_probabilities,
     evaluate_sequences,
@@ -33,13 +34,14 @@ from .object_representation import build_object_detections
 
 @dataclass
 class MethodRun:
-    """Frame logs, metrics, and pair-level output for one method."""
+    """Frame logs, metrics, and pair-/detection-level outputs for one method."""
 
     method_name: str
     per_sequence_metrics: list[dict[str, Any]]
     aggregate_metrics: dict[str, Any]
     frame_logs: list[FrameEvaluationLog]
     association_rows: list[dict[str, Any]]
+    detection_rows: list[dict[str, Any]]
     issues: list[DatasetIssue]
 
 
@@ -91,6 +93,7 @@ def _run_method(
     )
     frame_logs: list[FrameEvaluationLog] = []
     association_rows: list[dict[str, Any]] = []
+    detection_rows: list[dict[str, Any]] = []
     issues: list[DatasetIssue] = []
     processed_frames: dict[str, int] = {}
 
@@ -152,6 +155,32 @@ def _run_method(
                     result=result,
                 )
             )
+            accepted_identity_by_detection = {
+                assignment.detection_id: assignment.predicted_identity_id
+                for assignment in result.decision.accepted
+            }
+            candidate_count_by_detection = {detection_id: 0 for detection_id in gt_by_detection}
+            eligible_count_by_detection = {detection_id: 0 for detection_id in gt_by_detection}
+            for (predicted_id, detection_id), pair_outcome in result.decision.pair_outcomes.items():
+                candidate_count_by_detection[detection_id] += 1
+                if pair_outcome != "below_threshold":
+                    eligible_count_by_detection[detection_id] += 1
+            for detection_id, outcome in result.decision.detection_outcomes.items():
+                detection_rows.append(
+                    {
+                        "method": method_name,
+                        "sequence": sequence_name,
+                        "frame": frame.frame_name,
+                        "detection_id": detection_id,
+                        "outcome": outcome,
+                        "candidate_pair_count": candidate_count_by_detection[detection_id],
+                        "eligible_candidate_pair_count": eligible_count_by_detection[detection_id],
+                        "accepted_identity_id": accepted_identity_by_detection.get(detection_id),
+                        "new_predicted_identity_id": result.new_identity_by_detection.get(
+                            detection_id
+                        ),
+                    }
+                )
             selected = {
                 (assignment.predicted_identity_id, assignment.detection_id): assignment
                 for assignment in result.decision.assignments
@@ -170,6 +199,12 @@ def _run_method(
                     "score_kind": "probability" if method == "calibrated_selective" else "association_score",
                     "hungarian_selected": assignment is not None,
                     "accepted_for_memory": bool(assignment and assignment.accepted),
+                    "pair_outcome": result.decision.pair_outcomes[pair],
+                    "detection_outcome": result.decision.detection_outcomes[detection_id],
+                    "detection_rejected": result.decision.detection_outcomes[detection_id]
+                    == "confidence_rejection",
+                    "detection_assignment_conflict": result.decision.detection_outcomes[detection_id]
+                    == "assignment_conflict",
                     "pair_correct": int(
                         owner_before.get(predicted_id) == gt_by_detection[detection_id]
                     ),
@@ -195,6 +230,9 @@ def _run_method(
                     "correct_associations": 0,
                     "incorrect_associations": 0,
                     "rejected_associations": 0,
+                    "confidence_rejections": 0,
+                    "assignment_conflicts": 0,
+                    "no_candidate_detections": 0,
                     "new_predicted_identities": 0,
                     "eligible_gt_transitions": 0,
                     "association_assignment_decisions": 0,
@@ -204,6 +242,13 @@ def _run_method(
                     "association_f1": float("nan"),
                     "association_coverage": float("nan"),
                     "false_association_rate": float("nan"),
+                    "brier_score": float("nan"),
+                    "ece": float("nan"),
+                    "calibration_candidate_pairs": 0,
+                    "association_candidate_pairs": 0,
+                    "calibration_positive_candidate_pairs": 0,
+                    "calibration_negative_candidate_pairs": 0,
+                    "calibration_status": "not_applicable_no_processed_frames",
                     "occlusion_gaps": [],
                     "candidate_labels": [],
                     "candidate_probabilities": [],
@@ -225,6 +270,7 @@ def _run_method(
         aggregate_metrics=aggregate,
         frame_logs=frame_logs,
         association_rows=association_rows,
+        detection_rows=detection_rows,
         issues=issues,
     )
 
@@ -268,6 +314,8 @@ def _fit_for_gap(
         ),
         max_gap=gap,
         appearance_history_size=int(memory_config["appearance_history_size"]),
+        memory_policy="cosine_threshold",
+        cosine_threshold=float(config["association"]["cosine_threshold"]),
     )
     calibrator = fit_logistic_calibrator(
         candidates,
@@ -295,8 +343,26 @@ def run_experiment_suite(
 ) -> dict[str, Any]:
     """Run the main comparison, requested ablations, and validation analyses."""
 
-    train_names = list(train_sequence_names or dataset.train_sequences)
-    val_names = list(validation_sequence_names or dataset.validation_sequences)
+    train_names = list(
+        dataset.train_sequences if train_sequence_names is None else train_sequence_names
+    )
+    val_names = list(
+        dataset.validation_sequences
+        if validation_sequence_names is None
+        else validation_sequence_names
+    )
+    invalid_train_names = set(train_names) - set(dataset.train_sequences)
+    invalid_validation_names = set(val_names) - set(dataset.validation_sequences)
+    if invalid_train_names:
+        raise ValueError(
+            "Calibration training sequences must belong to the official training split: "
+            f"{sorted(invalid_train_names)}"
+        )
+    if invalid_validation_names:
+        raise ValueError(
+            "Evaluation sequences must belong to the official validation split: "
+            f"{sorted(invalid_validation_names)}"
+        )
     if set(train_names) & set(val_names):
         raise ValueError("Training and validation sequences must be disjoint")
     all_issues: list[DatasetIssue] = []
@@ -318,10 +384,26 @@ def run_experiment_suite(
         calibrator = fitted_calibrator
         if train_candidates.sequence_names - set(train_names):
             raise ValueError("Provided calibration candidates contain non-training sequences")
+        expected_generation_policy = (
+            "cosine_threshold;cosine_threshold="
+            f"{float(config['association']['cosine_threshold']):g}"
+        )
+        if train_candidates.generation_policy != expected_generation_policy:
+            raise ValueError(
+                "Provided calibration candidates use a different memory replay policy: "
+                f"expected {expected_generation_policy!r}, "
+                f"got {train_candidates.generation_policy!r}"
+            )
         if set(calibrator.metadata.get("training_sequences", ())) != set(train_names):
             raise ValueError("Provided calibrator training sequences do not match this run")
         if calibrator.metadata.get("validation_sequences_used_for_fit"):
             raise ValueError("Provided calibrator metadata shows validation data was used for fitting")
+        calibrator_policy = calibrator.metadata.get("candidate_generation_policy")
+        if calibrator_policy is not None and calibrator_policy != expected_generation_policy:
+            raise ValueError(
+                "Provided calibrator was fit with a different candidate memory replay policy: "
+                f"expected {expected_generation_policy!r}, got {calibrator_policy!r}"
+            )
 
     association_config = config["association"]
     base_weights = dict(association_config["weights"])
@@ -333,6 +415,7 @@ def run_experiment_suite(
     ]
     runs: dict[str, MethodRun] = {}
     association_rows: list[dict[str, Any]] = []
+    detection_rows: list[dict[str, Any]] = []
     per_sequence_rows: list[dict[str, Any]] = []
     metrics_rows: list[dict[str, Any]] = []
     for output_name, method, model, weights in method_specs:
@@ -351,6 +434,7 @@ def run_experiment_suite(
         metrics_rows.append(run.aggregate_metrics)
         per_sequence_rows.extend(run.per_sequence_metrics)
         association_rows.extend(run.association_rows)
+        detection_rows.extend(run.detection_rows)
         all_issues.extend(run.issues)
 
     proposed_logs = runs["calibrated_selective"].frame_logs
@@ -363,9 +447,17 @@ def run_experiment_suite(
     calibration_report["evaluation_sequences"] = val_names
     calibration_report["calibrator_training_sequences"] = train_names
     calibration_report["feature_names"] = list(calibrator.metadata["feature_names"])
+    calibration_report["metric_scope"] = "pooled_validation_candidate_pairs"
+    calibration_report["probability_interpretation"] = (
+        "Logistic-regression probability estimates; calibration is assessed on held-out data."
+    )
     curve = precision_coverage_curve(
         val_labels,
         val_probabilities,
+        config["evaluation"]["confidence_thresholds"],
+    )
+    assignment_curve = assignment_precision_coverage_curve(
+        proposed_logs,
         config["evaluation"]["confidence_thresholds"],
     )
 
@@ -457,6 +549,7 @@ def run_experiment_suite(
         "metrics": metrics_rows,
         "per_sequence_metrics": per_sequence_rows,
         "association_predictions": association_rows,
+        "detection_decisions": detection_rows,
         "calibration_candidates": [
             {
                 "sequence": log.sequence,
@@ -489,6 +582,8 @@ def run_experiment_suite(
         ],
         "calibration_metrics": calibration_report,
         "precision_coverage_curve": curve,
+        "precision_coverage_curve_level": "candidate_pair",
+        "assignment_precision_coverage_curve": assignment_curve,
         "occlusion_gap_metrics": gap_results,
         "appearance_ablation": appearance_rows,
         "calibration_ablation": calibration_ablation,
@@ -498,7 +593,12 @@ def run_experiment_suite(
             "positive_candidates": int(np.sum(train_candidates.labels == 1)),
             "negative_candidates": int(np.sum(train_candidates.labels == 0)),
             "sequences": sorted(train_candidates.sequence_names),
-            "candidate_generation_policy": "cosine_forced_online_memory; training sequences only",
+            "candidate_generation_policy": train_candidates.generation_policy,
+            "memory_policy_note": (
+                "Training replay uses thresholded cosine memory to include rejection-induced "
+                "new identities. Inference uses calibrated probability decisions, so memory "
+                "states can still differ when geometric features change those decisions."
+            ),
         },
         "calibrator_metadata": calibrator.metadata,
         "calibrator": calibrator,
