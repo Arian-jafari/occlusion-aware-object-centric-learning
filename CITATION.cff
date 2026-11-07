@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use this research scaffold, cite the repository version and the DAVIS 2017 dataset."
+title: "Calibrated Selective Re-Identification for Occlusion-Robust Object-Centric Video Representations"
+version: 0.1.0
+date-released: "2026-11-06"
+license: MIT
+authors:
+  - name: "Project contributors"

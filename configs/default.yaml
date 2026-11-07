@@ -1,0 +1,47 @@
+dataset:
+  root: /content/drive/MyDrive/DAVIS
+  train_split: train
+  validation_split: val
+
+features:
+  backbone: dinov2_vits14
+  torch_hub_repository: facebookresearch/dinov2
+  input_size: 518
+  batch_size: 4
+  cache_dir: /content/drive/MyDrive/occlusion_aware_association/cache/features
+  device: auto
+  use_mixed_precision: true
+
+memory:
+  max_gap: 30
+  appearance_history_size: 5
+
+association:
+  method: calibrated_selective
+  cosine_threshold: 0.5
+  fixed_score_threshold: 0.5
+  confidence_threshold: 0.5
+  weights:
+    appearance: 1.0
+    center_displacement: 0.25
+    bbox_iou: 0.25
+    area_ratio: 0.0
+
+calibration:
+  model: logistic_regression
+  class_weight: balanced
+  max_iter: 1000
+  random_state: 17
+
+evaluation:
+  ece_bins: 10
+  confidence_thresholds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  memory_gaps: [5, 15, 30, 60]
+
+experiment:
+  random_seed: 17
+  smoke_test: false
+  smoke_test_sequences: 2
+  smoke_test_frames: 8
+  output_dir: /content/drive/MyDrive/occlusion_aware_association/results
+  overwrite: false
