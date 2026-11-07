@@ -202,3 +202,4 @@ See [`CITATION.cff`](CITATION.cff) for this repository. Cite the data and frozen
 - Maxime Oquab et al. “DINOv2: Learning Robust Visual Features without Supervision.” [arXiv:2304.07193](https://arxiv.org/abs/2304.07193).
 
 This project describes an empirical investigation and makes no unsupported first-use or novelty claim.
+# occlusion-aware-object-centric-learning
