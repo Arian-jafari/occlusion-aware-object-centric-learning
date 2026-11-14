@@ -12,9 +12,9 @@ This is a focused empirical question about the relationship between pairwise con
 
 ## Research question and hypothesis
 
-**Research question:** Can selective identity assignment using logistic-regression probability estimates, evaluated for calibration on held-out data, reduce identity switches when objects reappear after occlusion, compared with forced matching and fixed similarity-threshold matching?
+**Research question:** Can selective identity assignment using logistic-regression probability estimates, evaluated for calibration on held-out data, reduce identity switches when objects reappear after mask-defined absence, compared with forced matching and fixed similarity-threshold matching?
 
-**Hypothesis:** Rejecting weak assignments will lower incorrect associations and identity switches for some operating thresholds. Rejection can create new predicted identities, so fragmentation may rise. The results must therefore report both errors and coverage rather than treating higher precision as a complete tracking improvement.
+**Hypothesis:** Rejecting weak assignments will lower incorrect associations and identity switches at some operating thresholds. Rejection can create new predicted identities, so fragmentation may rise. The results must therefore report both errors and coverage rather than treating higher precision as a complete tracking improvement. The validation threshold sweep replays the full sequence at each configured threshold; it is diagnostic and does not choose the reported operating threshold.
 
 ## Proposed method
 
@@ -44,14 +44,16 @@ Ground-truth instance masks serve as detections. Label 0 is background. The data
 
 Report per-sequence and aggregate identity switches, track fragmentations, correct/incorrect accepted associations, confidence rejections, assignment conflicts, no-candidate detections, new predicted identities, association precision/recall/F1, association coverage, and false association rate. For logistic probability estimates on validation candidate pairs, report per-sequence and pooled Brier score, configurable-bin ECE, reliability diagrams, and the number of candidate pairs. The candidate-pair precision/coverage curve is distinct from the additional assignment-level curve, which re-runs Hungarian assignment at each cutoff.
 
-An identity switch is a predicted-ID change between consecutive observed frames for one ground-truth object; its first observation is not a switch. Fragmentation counts a changed identity after an intervening valid annotated frame in which the object is absent. Candidate gaps crossing missing or invalid dataset frames are not described as natural occlusion. No artificial observation removal is implemented in this version.
+The logistic method uses six learned pair features, while cosine thresholding uses appearance alone and motion/appearance uses a fixed hand-weighted score. This is a comparison of complete association methods, not an isolated causal test of calibration. Brier score and ECE separately describe the logistic probabilities.
+
+An identity switch is a predicted-ID change between consecutive observed frames for one ground-truth object; its first observation is not a switch. Fragmentation counts a changed identity after an intervening valid annotated frame in which the object is absent. These are mask-defined absence/reappearance gaps; the masks do not establish whether an object was occluded or outside the view. Candidate gaps crossing missing or invalid dataset frames are excluded. No artificial observation removal is implemented in this version.
 
 ## Ablations
 
 - Appearance only; appearance plus center displacement; appearance plus center displacement and box IoU.
 - Raw cosine threshold versus logistic-probability selective decisions. Calibration quality is measured separately with Brier/ECE because cosine is not a probability and logistic regression probabilities are not assumed to be calibrated.
 - Memory gaps of 5, 15, 30, and 60 missing frames, with a training-only calibrator fit for each duration.
-- Validation confidence-threshold sweeps as candidate-pair and assignment-level diagnostic precision/coverage curves. The configured operating threshold is fixed independently of validation results.
+- Validation confidence-threshold sweeps as candidate-pair and assignment-level precision/coverage diagnostics plus full-sequence identity-switch/fragmentation replays. The configured operating threshold is fixed independently of validation results.
 - Natural reappearance outcomes grouped by missing-frame ranges. Artificially removed observations are excluded.
 
 ## Expected contributions
@@ -64,4 +66,4 @@ These are expected study artifacts, not established findings. Whether the observ
 
 ## Risks and limitations
 
-Ground-truth masks isolate association but make the protocol easier and narrower than a deployed tracking system. DINOv2 remains frozen. Logistic regression is intentionally simple; class weighting can affect probability estimates and is evaluated on held-out pairs. Thresholded-cosine training replay reduces but does not eliminate memory-state shift at calibrated inference: changed association decisions alter future prototypes and candidate features. A single dataset does not establish domain generalization. Rejection may trade incorrect associations for fragmentation. Missing/invalid dataset frames reduce the amount of evaluable natural-occlusion evidence. The project does not implement IDF1/HOTA or artificial occlusion removal.
+Ground-truth masks isolate association but make the protocol easier and narrower than a deployed tracking system. The masks establish object presence/absence, not the cause of absence. DINOv2 remains frozen. Logistic regression is intentionally simple; class weighting can affect probability estimates and is evaluated on held-out pairs. Thresholded-cosine training replay reduces but does not eliminate memory-state shift at inference: changed association decisions alter future prototypes and candidate features. A single dataset does not establish domain generalization. Rejection may trade incorrect associations for fragmentation. Missing/invalid dataset frames reduce the amount of evaluable absence/reappearance evidence. The project does not implement IDF1/HOTA or artificial observation removal.

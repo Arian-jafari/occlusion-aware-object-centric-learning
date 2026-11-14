@@ -461,6 +461,48 @@ def run_experiment_suite(
         config["evaluation"]["confidence_thresholds"],
     )
 
+    # Re-run the entire validation trajectory at each configured threshold.
+    # Reusing the main run at its operating threshold avoids an extra pass and
+    # keeps this sweep aligned with the actual stateful tracking policy.
+    operating_threshold = float(association_config["confidence_threshold"])
+    tracking_thresholds = [
+        float(value)
+        for value in config["evaluation"].get("tracking_confidence_thresholds", ())
+    ]
+    if not any(np.isclose(value, operating_threshold) for value in tracking_thresholds):
+        tracking_thresholds.append(operating_threshold)
+    unique_tracking_thresholds: list[float] = []
+    for threshold in tracking_thresholds:
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("Tracking confidence thresholds must be in [0, 1]")
+        if not any(np.isclose(threshold, seen) for seen in unique_tracking_thresholds):
+            unique_tracking_thresholds.append(threshold)
+
+    tracking_threshold_metrics: list[dict[str, Any]] = []
+    tracking_threshold_per_sequence_metrics: list[dict[str, Any]] = []
+    for threshold in unique_tracking_thresholds:
+        if np.isclose(threshold, operating_threshold):
+            threshold_run = runs["calibrated_selective"]
+        else:
+            threshold_run = _run_method(
+                dataset,
+                val_names,
+                cache,
+                method_name="calibrated_selective",
+                method="calibrated_selective",
+                config=config,
+                calibrator=calibrator,
+                confidence_threshold=threshold,
+                frame_limit=frame_limit,
+            )
+        aggregate_row = dict(threshold_run.aggregate_metrics)
+        aggregate_row["confidence_threshold"] = threshold
+        tracking_threshold_metrics.append(aggregate_row)
+        tracking_threshold_per_sequence_metrics.extend(
+            {**row, "confidence_threshold": threshold}
+            for row in threshold_run.per_sequence_metrics
+        )
+
     appearance_ablation_specs = [
         ("appearance_only", {"appearance": 1.0, "center_displacement": 0.0, "bbox_iou": 0.0, "area_ratio": 0.0}),
         ("appearance_plus_center", {"appearance": 1.0, "center_displacement": 0.25, "bbox_iou": 0.0, "area_ratio": 0.0}),
@@ -584,6 +626,8 @@ def run_experiment_suite(
         "precision_coverage_curve": curve,
         "precision_coverage_curve_level": "candidate_pair",
         "assignment_precision_coverage_curve": assignment_curve,
+        "tracking_confidence_threshold_metrics": tracking_threshold_metrics,
+        "tracking_confidence_threshold_per_sequence_metrics": tracking_threshold_per_sequence_metrics,
         "occlusion_gap_metrics": gap_results,
         "appearance_ablation": appearance_rows,
         "calibration_ablation": calibration_ablation,

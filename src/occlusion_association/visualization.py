@@ -14,7 +14,7 @@ METHOD_NAMES = {
     "cosine_forced": "Cosine forced",
     "cosine_threshold": "Cosine threshold",
     "motion_appearance": "Motion + appearance",
-    "calibrated_selective": "Calibrated selective",
+    "calibrated_selective": "Logistic selective",
     "appearance_only": "Appearance only",
     "appearance_plus_center": "Appearance + center",
     "appearance_center_iou": "Appearance + center + IoU",
@@ -52,6 +52,7 @@ def generate_plots(experiment_directory: str | Path) -> list[Path]:
     curve_path = experiment_directory / "precision_coverage_curve.csv"
     gap_path = experiment_directory / "occlusion_gap_metrics.json"
     memory_path = experiment_directory / "memory_duration_ablation.csv"
+    threshold_path = experiment_directory / "tracking_confidence_thresholds.csv"
     if not metrics_path.is_file():
         print(
             f"No experiment results found in {experiment_directory}. "
@@ -104,7 +105,7 @@ def generate_plots(experiment_directory: str | Path) -> list[Path]:
             accuracy = [item["empirical_accuracy"] for item in bins]
             figure, axis = plt.subplots()
             axis.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect calibration")
-            axis.plot(confidence, accuracy, marker="o", color="#E45756", label="Calibrated selective")
+            axis.plot(confidence, accuracy, marker="o", color="#E45756", label="Logistic selective")
             axis.set_xlim(0, 1)
             axis.set_ylim(0, 1)
             axis.set_title("Reliability diagram on held-out validation candidate pairs")
@@ -142,7 +143,7 @@ def generate_plots(experiment_directory: str | Path) -> list[Path]:
             y = [item["identity_consistency"] for item in points]
             axis.plot(x, y, marker="o", label=METHOD_NAMES.get(method, method))
         axis.set_ylim(0, 1.02)
-        axis.set_title("Natural reappearance identity consistency by absence gap")
+        axis.set_title("Identity consistency after mask-defined absence")
         axis.set_xlabel("Frames absent between observations")
         axis.set_ylabel("Fraction retaining the same predicted identity")
         axis.legend(frameon=False)
@@ -156,11 +157,11 @@ def generate_plots(experiment_directory: str | Path) -> list[Path]:
         memory = pd.read_csv(memory_path)
         if not memory.empty:
             figure, axes = plt.subplots(1, 2, figsize=(10.4, 4.4))
-            axes[0].plot(memory["max_memory_gap"], memory["identity_switches"], marker="o", label="Calibrated selective")
+            axes[0].plot(memory["max_memory_gap"], memory["identity_switches"], marker="o", label="Logistic selective")
             axes[0].set_title("Identity switches")
             axes[0].set_xlabel("Maximum missing-frame gap")
             axes[0].set_ylabel("Identity switches")
-            axes[1].plot(memory["max_memory_gap"], memory["association_precision"], marker="o", label="Calibrated selective")
+            axes[1].plot(memory["max_memory_gap"], memory["association_precision"], marker="o", label="Logistic selective")
             axes[1].set_title("Association precision")
             axes[1].set_xlabel("Maximum missing-frame gap")
             axes[1].set_ylabel("Association precision")
@@ -169,6 +170,35 @@ def generate_plots(experiment_directory: str | Path) -> list[Path]:
             figure.suptitle("Performance versus memory duration")
             figure.tight_layout()
             destination = figure_directory / "memory_duration"
+            _save_figure(figure, destination)
+            plt.close(figure)
+            created.extend([destination.with_suffix(".png"), destination.with_suffix(".pdf")])
+
+    if threshold_path.is_file():
+        thresholds = pd.read_csv(threshold_path).sort_values("confidence_threshold")
+        if not thresholds.empty:
+            figure, axes = plt.subplots(1, 2, figsize=(10.4, 4.4))
+            axes[0].plot(
+                thresholds["confidence_threshold"],
+                thresholds["identity_switches"],
+                marker="o",
+                label="Identity switches",
+            )
+            axes[0].set_title("Identity switches")
+            axes[1].plot(
+                thresholds["confidence_threshold"],
+                thresholds["track_fragmentations"],
+                marker="o",
+                color="#E45756",
+                label="Fragmentations",
+            )
+            axes[1].set_title("Track fragmentations")
+            for axis in axes:
+                axis.set_xlabel("Confidence threshold")
+                axis.legend(frameon=False)
+            figure.suptitle("Full-tracking results by confidence threshold")
+            figure.tight_layout()
+            destination = figure_directory / "tracking_confidence_thresholds"
             _save_figure(figure, destination)
             plt.close(figure)
             created.extend([destination.with_suffix(".png"), destination.with_suffix(".pdf")])

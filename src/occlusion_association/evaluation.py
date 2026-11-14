@@ -180,7 +180,7 @@ def evaluate_sequences(
     the first observation is never a switch. Fragmentation counts only changes
     after at least one intervening frame with a valid image/annotation pair in
     which the object is absent. Gaps containing missing or invalid dataset
-    frames are excluded from natural-occlusion fragmentation analysis.
+    frames are excluded from mask-defined absence fragmentation analysis.
 
     Association recall's denominator is the number of current object
     observations for which a retained, previously associated memory identity
@@ -473,7 +473,7 @@ def occlusion_gap_metrics(
         ("31+", 31, None),
     ),
 ) -> list[dict[str, Any]]:
-    """Aggregate natural GT absence/reappearance identity consistency by gap."""
+    """Aggregate mask-defined GT absence/reappearance identity consistency by gap."""
 
     all_gaps = [gap for sequence in per_sequence for gap in sequence["occlusion_gaps"]]
     result = []

@@ -1,4 +1,4 @@
-# Calibrated Selective Re-Identification for Occlusion-Robust Object-Centric Video Representations
+# Selective Identity Association After Object Absence
 
 This project tests whether logistic-regression association probability estimates, evaluated for calibration on held-out data, and selective rejection reduce identity switches when objects reappear after absence. It is an empirical investigation of object identity association under occlusion; it does not claim to solve object discovery, segmentation, or general-purpose multi-object tracking.
 
@@ -8,7 +8,7 @@ No DAVIS data, model checkpoints, extracted feature caches, or fabricated experi
 
 ## Research question and hypothesis
 
-**Question:** Can selective identity assignment using probability estimates whose calibration is evaluated on held-out data reduce identity switches after object absence, compared with forced cosine matching and fixed-threshold matching?
+**Question:** Can selective identity assignment using probability estimates whose calibration is evaluated on held-out data reduce identity switches after mask-defined object absence, compared with forced cosine matching and fixed-threshold matching?
 
 **Hypothesis:** Allowing the association system to reject weak matches will reduce incorrect identity assignments. This may increase fragmentation, so precision, recall, coverage, identity switches, and fragmentation are reported separately.
 
@@ -133,6 +133,8 @@ experiment_.../
 ├── appearance_ablation.csv
 ├── calibration_ablation.csv
 ├── memory_duration_ablation.csv
+├── tracking_confidence_thresholds.csv
+├── tracking_confidence_thresholds_per_sequence.csv
 ├── occlusion_gap_metrics.json
 ├── dataset_loading_issues.json
 ├── experiment_summary.md
@@ -145,8 +147,8 @@ Metadata records the UTC run time, commit hash when available, Python/PyTorch/CU
 ## Metrics and evaluation definitions
 
 - **Identity switches:** a change in the predicted identity assigned to the same ground-truth object between consecutive observed frames. The first observation is not a switch. Reappearance changes count even after a gap.
-- **Track fragmentation:** an identity change after at least one intervening valid image/annotation frame in which the object was absent. Intervals containing missing or invalid dataset frames are not counted as natural occlusion fragmentation.
-- **Correct association:** an accepted Hungarian match whose memory identity's prior ground-truth owner equals the current detection's ground-truth label. This label is used after the decision for evaluation only.
+- **Track fragmentation:** an identity change after at least one intervening valid image/annotation frame in which the object was absent. Intervals containing missing or invalid dataset frames are excluded.
+- **Correct association:** an accepted Hungarian match whose memory identity's prior ground-truth owner equals the current detection's ground-truth label. This label is used after the decision for evaluation only. Rejections can leave multiple active predicted identities associated with one ground-truth object, so this pair-level target is same-object correctness, not necessarily continuity with the object's most recently assigned predicted ID. Identity switches are measured separately.
 - **Incorrect association:** an accepted match between different ground-truth objects.
 - **Rejected association (`rejected_associations`):** a detection had candidate pairs, but none met the applicable threshold. This metric counts confidence rejections only. Assignment conflicts are reported separately; both outcomes start a new predicted identity, while a detection with no candidate also starts a new ID.
 - **Confidence rejection:** a detection had candidates, but no candidate reached the method's threshold.
@@ -158,8 +160,9 @@ Metadata records the UTC run time, commit hash when available, Python/PyTorch/CU
 - **Association coverage:** accepted matches divided by detections that had at least one memory candidate. Confidence rejections and assignment conflicts are separate counts; no-candidate detections are excluded.
 - **False association rate:** incorrect accepted associations divided by all accepted associations.
 - **Brier score and ECE:** computed only for logistic probability estimates on held-out validation candidate pairs, pooled and per sequence, with candidate-pair counts. Raw-score methods are marked not applicable, not as empty candidate data. Empty probability sets produce undefined (NaN) metrics; single-class Brier/ECE are calculable but have limited class support. No logistic probabilities are assumed calibrated. Raw cosine is a similarity, not a probability, so it is not given Brier/ECE scores.
-- **Precision–coverage curves:** the candidate-pair curve thresholds pair predictions independently. A separate assignment-level curve reruns one-to-one Hungarian assignment at each cutoff. Neither is a replacement for tracking metrics.
-- **Natural occlusion gaps:** identity consistency between observations when every intervening frame has a valid annotation. No artificial observation removal is performed in this version.
+- **Precision–coverage curves:** the candidate-pair curve thresholds pair predictions independently. A separate assignment-level curve reruns one-to-one Hungarian assignment at each cutoff using the same frame-level candidate states. Neither is a replacement for tracking metrics.
+- **Tracking confidence-threshold sweep:** each configured threshold replays complete validation sequences with fresh memory and reports identity switches, fragmentation, association precision, and coverage. The sweep is diagnostic; it does not select the configured operating threshold.
+- **Mask-defined absence/reappearance gaps:** identity consistency between observations when every intervening frame has a valid annotation. DAVIS masks show whether an object is present; a gap alone does not distinguish occlusion from leaving the view. No artificial observation removal is performed in this version.
 
 IDF1 and HOTA are omitted because the project does not include a validated implementation for the oracle-mask association protocol. It does not report approximate values under those names.
 
@@ -172,11 +175,11 @@ The following is an empty reporting template, not an experimental result:
 | Cosine forced | — | — | — | — | — | N/A | N/A |
 | Cosine threshold | — | — | — | — | — | N/A | N/A |
 | Motion + appearance | — | — | — | — | — | N/A | N/A |
-| Calibrated selective | — | — | — | — | — | — | — |
+| Logistic probability selective | — | — | — | — | — | — | — |
 
 ## Reproducibility
 
-Python, NumPy, PyTorch, and CUDA seeds are set from the central configuration. Logistic regression also receives an explicit scikit-learn `random_state`. Training candidate pairs use thresholded-cosine memory replay on training sequences to include rejection-induced new identities. Selective inference uses probability thresholds and can still produce different memory states when geometric features affect decisions; this remaining train/inference shift is documented. Brier score and ECE are evaluated on held-out validation pairs. Validation threshold sweeps are diagnostics only. The configured operating threshold is fixed independently of validation results.
+Python, NumPy, PyTorch, and CUDA seeds are set from the central configuration. Logistic regression also receives an explicit scikit-learn `random_state`. Training candidate pairs use thresholded-cosine memory replay on training sequences to include rejection-induced new identities. Selective inference uses probability thresholds and can still produce different memory states when geometric features affect decisions; this remaining train/inference shift is documented. Brier score and ECE are evaluated on held-out validation pairs. Candidate-pair, frame-level assignment, and full-tracking threshold sweeps are validation diagnostics only. The configured operating threshold is fixed independently of validation results. The probability method uses six features, while the cosine baseline uses appearance alone, so their comparison evaluates complete methods rather than isolating calibration.
 
 The current project includes a CPU-compatible synthetic end-to-end experiment that requires neither DAVIS nor a pretrained model. Run it with:
 
@@ -196,8 +199,9 @@ Tests do not download pretrained weights or datasets. Full DAVIS runs and GPU in
 6. Higher association precision alone does not establish better tracking.
 7. Calibration quality is evaluated separately from identity tracking metrics.
 8. Validation sequences are never used to train the calibrator.
-9. Artificially removed observations are not implemented or mixed into natural-occlusion results.
+9. Artificially removed observations are not implemented or mixed into mask-defined absence results.
 10. A successful experiment does not establish publication-level novelty.
+11. The pairwise calibration target measures same-object ownership; it is not a direct target for preserving the most recent predicted track ID.
 
 See [`docs/limitations.md`](docs/limitations.md), [`docs/methodology.md`](docs/methodology.md), and [`docs/experimental_protocol.md`](docs/experimental_protocol.md) for the detailed protocol.
 

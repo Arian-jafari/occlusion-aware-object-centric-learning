@@ -45,6 +45,7 @@ def test_tiny_synthetic_end_to_end_experiment_runs_without_dataset_or_gpu(
     config["features"]["cache_dir"] = str(tmp_path / "feature_cache")
     config["evaluation"]["memory_gaps"] = [5, 30]
     config["evaluation"]["confidence_thresholds"] = [0.25, 0.5, 0.75]
+    config["evaluation"]["tracking_confidence_thresholds"] = [0.25, 0.5, 0.75]
     dataset = create_synthetic_davis(tmp_path / "DAVIS")
     cache = FeatureCache(config["features"]["cache_dir"])
     backbone = f"{config['features']['torch_hub_repository']}:{config['features']['backbone']}"
@@ -114,6 +115,20 @@ def test_tiny_synthetic_end_to_end_experiment_runs_without_dataset_or_gpu(
     assert "ece" in result["calibration_metrics"]
     assert result["precision_coverage_curve_level"] == "candidate_pair"
     assert result["assignment_precision_coverage_curve"]
+    assert [
+        row["confidence_threshold"]
+        for row in result["tracking_confidence_threshold_metrics"]
+    ] == [0.25, 0.5, 0.75]
+    operating_point = next(
+        row
+        for row in result["tracking_confidence_threshold_metrics"]
+        if row["confidence_threshold"] == config["association"]["confidence_threshold"]
+    )
+    main_selective = next(
+        row for row in result["metrics"] if row["method"] == "calibrated_selective"
+    )
+    assert operating_point["identity_switches"] == main_selective["identity_switches"]
+    assert operating_point["track_fragmentations"] == main_selective["track_fragmentations"]
     assert any(
         row["outcome"] == "no_candidate" for row in result["detection_decisions"]
     )
@@ -142,10 +157,13 @@ def test_tiny_synthetic_end_to_end_experiment_runs_without_dataset_or_gpu(
     assert (output / "detection_decisions.csv").is_file()
     assert (output / "training_calibration_candidates.csv").is_file()
     assert (output / "assignment_precision_coverage_curve.csv").is_file()
+    assert (output / "tracking_confidence_thresholds.csv").is_file()
+    assert (output / "tracking_confidence_thresholds_per_sequence.csv").is_file()
     assert (output / "calibrator.joblib").is_file()
     assert (output / "experiment_summary.md").is_file()
     assert (output / "figures" / "reliability_diagram.png").is_file()
     assert (output / "figures" / "identity_switches.pdf").is_file()
+    assert (output / "figures" / "tracking_confidence_thresholds.png").is_file()
 
 
 def test_experiment_runner_rejects_validation_sequences_as_calibration_training(

@@ -1,4 +1,4 @@
-"""Hungarian association baselines and calibrated selective decisions."""
+"""Hungarian association baselines and logistic-probability selective decisions."""
 
 from __future__ import annotations
 

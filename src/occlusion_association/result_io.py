@@ -22,6 +22,9 @@ def _write_plot_inputs(results: dict[str, Any], directory: Path) -> None:
     pd.DataFrame(results["memory_duration_ablation"]).to_csv(
         directory / "memory_duration_ablation.csv", index=False
     )
+    pd.DataFrame(results["tracking_confidence_threshold_metrics"]).to_csv(
+        directory / "tracking_confidence_thresholds.csv", index=False
+    )
     write_json(directory / "calibration_metrics.json", results["calibration_metrics"])
     write_json(directory / "occlusion_gap_metrics.json", results["occlusion_gap_metrics"])
 
@@ -48,6 +51,26 @@ def _write_summary(results: dict[str, Any], directory: Path) -> None:
             f"| {row['method']} | {row['identity_switches']} | {row['track_fragmentations']} | "
             f"{precision_text} | {coverage_text} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Full-tracking confidence threshold sweep",
+            "",
+            "Each row replays the complete validation sequences with a fresh identity memory at that threshold. These validation results are diagnostic and do not select the operating threshold.",
+            "",
+            "| Confidence threshold | Identity switches | Fragmentations | Association precision | Coverage |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in results["tracking_confidence_threshold_metrics"]:
+        precision = row.get("association_precision")
+        coverage = row.get("association_coverage")
+        precision_text = f"{precision:.4f}" if precision is not None and pd.notna(precision) else "NA"
+        coverage_text = f"{coverage:.4f}" if coverage is not None and pd.notna(coverage) else "NA"
+        lines.append(
+            f"| {row['confidence_threshold']:.3f} | {row['identity_switches']} | "
+            f"{row['track_fragmentations']} | {precision_text} | {coverage_text} |"
+        )
     calibration = results["calibration_metrics"]
     lines.extend(
         [
@@ -59,7 +82,7 @@ def _write_summary(results: dict[str, Any], directory: Path) -> None:
             f"ECE: {calibration.get('ece')}",
             "",
             "Raw cosine is a similarity score, not a probability; Brier and ECE are reported only for logistic probabilities.",
-            "The candidate-pair precision/coverage curve thresholds pairs independently. The assignment-level curve reruns one-to-one assignment at each cutoff.",
+            "The candidate-pair precision/coverage curve thresholds pairs independently. The assignment-level curve reruns one-to-one assignment at each cutoff on the logged frame states.",
             "Confidence rejection means no candidate met threshold; assignment conflict means an eligible candidate lost the global one-to-one assignment. These outcomes are counted separately.",
             "",
             "## Scope and limits",
@@ -160,6 +183,12 @@ def export_experiment_results(
     )
     pd.DataFrame(results["memory_duration_ablation"]).to_csv(
         directory / "memory_duration_ablation.csv", index=False
+    )
+    pd.DataFrame(results["tracking_confidence_threshold_metrics"]).to_csv(
+        directory / "tracking_confidence_thresholds.csv", index=False
+    )
+    pd.DataFrame(results["tracking_confidence_threshold_per_sequence_metrics"]).to_csv(
+        directory / "tracking_confidence_thresholds_per_sequence.csv", index=False
     )
     write_json(directory / "calibration_metrics.json", calibration)
     write_json(directory / "occlusion_gap_metrics.json", results["occlusion_gap_metrics"])

@@ -36,6 +36,7 @@ calibration:
 evaluation:
   ece_bins: 10
   confidence_thresholds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  tracking_confidence_thresholds: [0.3, 0.5, 0.7]  # Full-sequence validation replays; diagnostic only.
   memory_gaps: [5, 15, 30, 60]
 
 experiment:
