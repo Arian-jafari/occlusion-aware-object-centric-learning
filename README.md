@@ -118,13 +118,6 @@ python scripts/summarize_results.py results/experiment_YYYYMMDDTHHMMSSZ
 
 A CPU-compatible synthetic test suite is available with `python -m pytest`. Tests do not download DAVIS or pretrained weights. Full feature extraction requires the dataset and a PyTorch runtime; CUDA is recommended.
 
-## Research and CV description
-
-A concise, accurate CV description could be:
-
-> **Ongoing research - Selective Identity Association After Object Absence:** Built a reproducible DAVIS-based study of online identity association using frozen DINOv2 features, train-only logistic confidence estimation, and threshold-aware Hungarian assignment; evaluated identity switches, fragmentation, coverage, and calibration on held-out sequences.
-
-The current results should be discussed as preliminary validation findings, including the fact that selective rejection increased identity switches while geometry-based matching reduced them in this oracle-mask setting.
 
 ## Citation
 
