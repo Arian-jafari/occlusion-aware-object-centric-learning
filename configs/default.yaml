@@ -1,5 +1,5 @@
 dataset:
-  root: /content/drive/MyDrive/DAVIS
+  root: ./data/DAVIS
   train_split: train
   validation_split: val
 
@@ -7,9 +7,9 @@ features:
   backbone: dinov2_vits14
   torch_hub_repository: facebookresearch/dinov2
   input_size: 518
-  batch_size: 4
-  cache_dir: /content/drive/MyDrive/occlusion_aware_association/cache/features
-  device: auto
+  batch_size: 2
+  cache_dir: ./data/cache/features
+  device: cuda
   use_mixed_precision: true
 
 memory:
@@ -44,5 +44,5 @@ experiment:
   smoke_test: false
   smoke_test_sequences: 2
   smoke_test_frames: 8
-  output_dir: /content/drive/MyDrive/occlusion_aware_association/results
+  output_dir: ./results
   overwrite: false

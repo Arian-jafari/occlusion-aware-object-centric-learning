@@ -1,16 +1,33 @@
 # Selective Identity Association After Object Absence
 
-This project tests whether logistic-regression association probability estimates, evaluated for calibration on held-out data, and selective rejection reduce identity switches when objects reappear after absence. It is an empirical investigation of object identity association under occlusion; it does not claim to solve object discovery, segmentation, or general-purpose multi-object tracking.
+**Status: Ongoing research project**
 
-The experiment uses DAVIS 2017 TrainVal 480p. Ground-truth instance masks are supplied as detections to isolate association quality from segmentation errors. The visual representation is frozen DINOv2 ViT-S/14 spatial patch features pooled inside each mask. An unweighted standardized logistic regression estimates the probability that a memory identity and a current detection belong to the same object. Thresholded methods can leave detections and memory tracks unmatched during assignment; unmatched candidate detections start new predicted identities.
+This project studies whether a learned association-confidence model and selective rejection can preserve object identity when an object disappears from valid video annotations and later reappears. It focuses on the association stage of video tracking; it does not evaluate object detection, segmentation, or a complete tracking system.
 
-No DAVIS data, model checkpoints, extracted feature caches, or fabricated experimental results are stored in this repository.
+The current pipeline uses DAVIS 2017 TrainVal 480p, frozen DINOv2 ViT-S/14 spatial features pooled inside ground-truth instance masks, an online identity memory, and Hungarian assignment. Ground-truth masks serve as oracle detections so the experiment isolates association behavior. The confidence model is a training-split-only standardized logistic regression over six appearance and geometry features.
 
-## Research question and hypothesis
+## Research question
 
-**Question:** Can selective identity assignment using probability estimates whose calibration is evaluated on held-out data reduce identity switches after mask-defined object absence, compared with forced cosine matching and fixed-threshold matching?
+Can selective identity assignment based on learned pairwise probabilities reduce incorrect associations after mask-defined object absence, while balancing identity continuity, fragmentation, precision, and coverage?
 
-**Hypothesis:** Allowing the association system to reject weak matches will reduce incorrect identity assignments. This may increase fragmentation, so precision, recall, coverage, identity switches, and fragmentation are reported separately.
+The project is ongoing. Its current full validation run does **not** support the initial hypothesis that the logistic selective method reduces identity switches. Results below are reported as observed, including this negative outcome.
+
+## Current results
+
+The recorded full run evaluates all 30 official DAVIS validation sequences. It uses oracle masks as detections and has no independent test split. At the configured confidence threshold of 0.5:
+
+| Method | Identity switches | Fragmentations | Association precision | Coverage |
+|---|---:|---:|---:|---:|
+| Cosine forced | 14 | 2 | 99.64% | 100.00% |
+| Cosine threshold | 14 | 2 | 99.64% | 100.00% |
+| Appearance + center + box overlap | **2** | **0** | **99.95%** | 100.00% |
+| Logistic probability selective | 51 | 2 | 99.77% | 99.15% |
+
+The selective method's identity switches increased from 29 at confidence threshold 0.3 to 51 at 0.5 and 83 at 0.7, as confidence rejections increased. In the appearance/geometry ablation, adding center displacement reduced switches from 14 to 4, and adding box overlap reduced them to 2. These results make geometry a promising direction in this setup; further controlled and replicated evaluation is needed.
+
+The full run's held-out candidate-pair Brier score is 0.058 and ECE is 0.046 over 14,290 candidate pairs. These assess probability estimates; they do not imply improved identity tracking. Only six mask-defined reappearances occurred in the 1 to 15 frame gap bins, and none occurred in longer bins, so the current data are too sparse for strong gap-specific conclusions.
+
+The detailed CSV, JSON, figure, and summary files are generated under the run directory in `results/`; those run artifacts are not committed. These figures summarize validation results, not independent test estimates.
 
 ## Method overview
 
@@ -22,195 +39,96 @@ flowchart LR
     D --> E[Cached object embeddings]
     E --> F[Identity memory and pair features]
     F --> G[Hungarian baselines]
-    F --> H[Training-only logistic confidence model]
-    H --> I[Selective accept or reject]
+    F --> H[Train-only logistic confidence model]
+    H --> I[Threshold-aware assignment]
     G --> J[Held-out validation metrics]
     I --> J
-    C --> J
 ```
 
-Candidate features include cosine similarity, normalized center displacement, previous/current bounding-box IoU, symmetric area ratio, normalized frames since the last observation, and the cosine margin against competing identities. The feature calculation is separate from each decision rule. Detections receive deterministic local IDs from their geometry; ground-truth labels are kept outside association inputs and used only to generate calibration targets and evaluation labels.
+The pair features are cosine similarity, normalized center displacement, bounding-box IoU, symmetric area ratio, normalized observation age, and a competing-identity similarity margin. Ground-truth labels are kept out of association inputs; they are used to build training targets and evaluate decisions. Thresholded assignment includes unmatched choices, so a detection without an accepted match starts a new predicted identity.
 
-The comparison includes:
+Compared methods include forced cosine matching, thresholded cosine matching, fixed-threshold appearance/geometry matching, and logistic-probability selective matching. The experiment also reports appearance/geometry and memory-duration ablations, calibration metrics, candidate and assignment precision/coverage curves, and full-sequence confidence-threshold replays.
 
-- Cosine Hungarian assignment with forced acceptance.
-- Cosine Hungarian assignment with a fixed threshold.
-- Appearance and geometry Hungarian matching with a fixed score threshold.
-- Logistic probability scores with threshold-aware Hungarian assignment and unmatched choices.
+## Scope and interpretation
 
-The loader requires both official train and validation lists, rejects overlap, and the experiment runner restricts fitting and evaluation names to their corresponding official lists. The calibrator is fit from training-sequence candidate pairs only. This repository's DAVIS TrainVal configuration has no independent labeled test split, so validation is reported as held-out validation rather than an untouched test result. Validation candidate pairs do not fit the model or select the configured operating threshold.
+- DAVIS masks are oracle detections. Segmentation quality, object discovery, detector recall, and end-to-end tracking performance are not measured.
+- Mask-defined absence does not reveal whether an object was occluded or left the field of view. Results are described as absence/reappearance analysis.
+- DAVIS TrainVal provides training and validation splits here, not an independent labeled test split. The calibrator is fit on training sequences only; thresholds are not selected using validation results.
+- The pairwise model target is whether a memory identity was previously associated with the same ground-truth object. It is not identical to preserving the latest predicted track ID.
+- The current calibration training replay uses thresholded cosine matching, while selective inference uses learned probabilities and geometry. This can create a train/inference memory-state mismatch.
+- Results come from one validation run and do not establish generalization or publication-level novelty. Confidence intervals, broader datasets, and a controlled calibration comparison remain future work.
 
-## Dataset
+See [methodology](docs/methodology.md), [experimental protocol](docs/experimental_protocol.md), and [limitations](docs/limitations.md) for full definitions and assumptions.
 
-Download **DAVIS 2017 Semi-supervised TrainVal 480p** from the [official DAVIS downloads page](https://davischallenge.org/davis2017/code.html). The loader does not download the data and does not fall back to an unofficial mirror.
+## Dataset and setup
 
-The expected files are:
+Download **DAVIS 2017 Semi-supervised TrainVal 480p** from the [official DAVIS page](https://davischallenge.org/davis2017/code.html). The loader does not download data. Both official split lists are required. The expected layout is:
 
 ```text
 data/DAVIS/
-├── ImageSets/2017/train.txt
-├── ImageSets/2017/val.txt
-├── JPEGImages/480p/<sequence>/<frame>.jpg
-└── Annotations/480p/<sequence>/<frame>.png
+  ImageSets/2017/train.txt
+  ImageSets/2017/val.txt
+  JPEGImages/480p/<sequence>/<frame>.jpg
+  Annotations/480p/<sequence>/<frame>.png
 ```
 
-The loader also recognizes a common additional directory level, for example `data/DAVIS/DAVIS/JPEGImages/480p`. It matches images and masks by filename stem, validates the official split lists, checks mask dimensionality and image/mask dimensions, and reports missing pairs, invalid frames, and skipped sequences. Background label `0` is excluded from object detections. An object absent from a valid mask frame simply has no detection in that frame.
-
-DAVIS train and validation split files are both mandatory. If validation is absent, the loader stops instead of reusing training sequences. The official page provides the TrainVal images and annotations at 480p. [DAVIS 2017 downloads](https://davischallenge.org/davis2017/code.html)
-
-## Colab setup
-
-1. Upload or clone this repository into `/content/occlusion-aware-object-association`.
-2. Download DAVIS TrainVal 480p from the official page and place it in Google Drive under `/content/drive/MyDrive/DAVIS`.
-3. Open [`notebooks/occlusion_aware_association.ipynb`](notebooks/occlusion_aware_association.ipynb) in Colab and run from the top.
-4. The notebook's configuration cell has one `DAVIS_ROOT` path and one `RUN_MODE` switch (`smoke` or `full`).
-
-Colab supplies PyTorch. `requirements.txt` installs the project and its CPU-compatible data, scientific, plotting, and test dependencies without replacing PyTorch or downloading DINOv2 development tools. The official pretrained backbone is loaded with `torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")`; its model weights are kept in the Torch Hub cache, outside this repository. [Official DINOv2 PyTorch Hub instructions](https://github.com/facebookresearch/dinov2#pretrained-backbones-via-pytorch-hub)
-
-## Command-line workflow
-
-Install dependencies in Colab or another Python environment that already has PyTorch:
+Install the requirements in an environment that already has PyTorch:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Set the DAVIS path, cache directory, and output directory in [`configs/default.yaml`](configs/default.yaml), then inspect the full TrainVal dataset:
+For the notebook, use a CUDA-enabled PyTorch kernel. In Colab, select a GPU runtime; for local use, install a PyTorch build compatible with the available CUDA driver. The notebook checks GPU availability and shows `tqdm` progress bars for long-running dataset and experiment stages. Configure the DAVIS path in [`notebooks/occlusion_aware_association.ipynb`](notebooks/occlusion_aware_association.ipynb) or [`configs/default.yaml`](configs/default.yaml).
+
+The frozen backbone is loaded through the official DINOv2 Torch Hub entry point. The first load needs network access; checkpoints remain in the Torch Hub cache and are not stored in this repository. [DINOv2 pretrained-backbone instructions](https://github.com/facebookresearch/dinov2#pretrained-backbones-via-pytorch-hub)
+
+## Command-line workflow
+
+Inspect the full dataset:
 
 ```bash
 python scripts/inspect_dataset.py --config configs/default.yaml --split all
 ```
 
-Run a small feature and experiment smoke test:
+Extract features and run a small smoke experiment:
 
 ```bash
 python scripts/extract_features.py --config configs/default.yaml --split all --smoke-test
 python scripts/run_experiments.py --config configs/default.yaml --smoke-test
 ```
 
-Run complete feature extraction and evaluation:
+For a full run, remove `--smoke-test`:
 
 ```bash
 python scripts/extract_features.py --config configs/default.yaml --split all
 python scripts/run_experiments.py --config configs/default.yaml
 ```
 
-Features are cached by sequence, frame, object label, preprocessing settings, decoded source-image and mask content digests, and the exact backbone state-dict SHA-256. Extraction records the active checkpoint fingerprint in the cache directory so calibration and experiment readers use the same revision. Repeated extraction skips compatible entries; changed image/mask pixels, checkpoint weights, backbone, or preprocessing produce different keys. Caches created with the older key schema will miss and be regenerated; old files are left in place. Experiment runs receive unique output directories by default. To intentionally replace a named result directory, pass `--experiment-name NAME --overwrite`.
+Feature-cache keys include source image/mask digests, preprocessing settings, and the exact backbone state-dict fingerprint. Compatible cached features are reused. Experiment outputs go to unique directories under `results/`; to replace a named result directory, use `--experiment-name NAME --overwrite`.
 
-The calibrator can also be trained and saved separately. It consumes cached **training-split** features only:
+## Outputs and reproducibility
 
-```bash
-python scripts/train_calibrator.py --config configs/default.yaml
-```
+Each experiment directory contains the configuration and runtime metadata, aggregate and per-sequence metrics, pair-level predictions, detection decisions, calibration candidates and model, ablations, threshold analyses, loading issues, summary, and figures. Metadata includes the train/validation sequence lists, software and GPU versions, random seed, and Git commit when available.
 
-The main runner refits the calibrator as part of its recorded experiment, runs the baselines and proposed method, performs the appearance/motion, memory-duration, and confidence-threshold analyses, and exports metrics and figures. To inspect an existing run:
+To summarize an existing run:
 
 ```bash
-python scripts/summarize_results.py /path/to/results/experiment_YYYYMMDDTHHMMSSZ
+python scripts/summarize_results.py results/experiment_YYYYMMDDTHHMMSSZ
 ```
 
-## Configuration and outputs
+A CPU-compatible synthetic test suite is available with `python -m pytest`. Tests do not download DAVIS or pretrained weights. Full feature extraction requires the dataset and a PyTorch runtime; CUDA is recommended.
 
-[`configs/default.yaml`](configs/default.yaml) contains the dataset root, official split names, DINOv2 backbone, preprocessing size and batch size, persistent cache path, memory gap, association thresholds and weights, logistic regression settings (unweighted by default), ECE bins, confidence thresholds, memory-duration sweep, random seed, smoke-test limits, and output directory.
+## Research and CV description
 
-Each experiment directory contains:
+A concise, accurate CV description could be:
 
-```text
-experiment_.../
-├── config.yaml
-├── metadata.json
-├── metrics.csv
-├── per_sequence_metrics.csv
-├── association_predictions.csv
-├── detection_decisions.csv
-├── calibration_candidates.csv
-├── training_calibration_candidates.csv
-├── calibration_metrics.json
-├── precision_coverage_curve.csv
-├── assignment_precision_coverage_curve.csv
-├── calibrator.joblib
-├── calibrator.json
-├── appearance_ablation.csv
-├── calibration_ablation.csv
-├── memory_duration_ablation.csv
-├── tracking_confidence_thresholds.csv
-├── tracking_confidence_thresholds_per_sequence.csv
-├── occlusion_gap_metrics.json
-├── dataset_loading_issues.json
-├── experiment_summary.md
-├── logs/run.log
-└── figures/                 # PNG and PDF
-```
+> **Ongoing research - Selective Identity Association After Object Absence:** Built a reproducible DAVIS-based study of online identity association using frozen DINOv2 features, train-only logistic confidence estimation, and threshold-aware Hungarian assignment; evaluated identity switches, fragmentation, coverage, and calibration on held-out sequences.
 
-Metadata records the UTC run time, commit hash when available, Python/PyTorch/CUDA/GPU information, exact train/validation sequence lists, backbone, random seed, smoke/full mode, and configuration. Output directories are unique by default; no results are overwritten unless a named run is explicitly marked for overwrite.
-
-## Metrics and evaluation definitions
-
-- **Identity switches:** a change in the predicted identity assigned to the same ground-truth object between consecutive observed frames. The first observation is not a switch. Reappearance changes count even after a gap.
-- **Track fragmentation:** an identity change after at least one intervening valid image/annotation frame in which the object was absent. Intervals containing missing or invalid dataset frames are excluded.
-- **Correct association:** an accepted Hungarian match whose memory identity's prior ground-truth owner equals the current detection's ground-truth label. This label is used after the decision for evaluation only. Rejections can leave multiple active predicted identities associated with one ground-truth object, so this pair-level target is same-object correctness, not necessarily continuity with the object's most recently assigned predicted ID. Identity switches are measured separately.
-- **Incorrect association:** an accepted match between different ground-truth objects.
-- **Rejected association (`rejected_associations`):** a detection had candidate pairs, but none met the applicable threshold. This metric counts confidence rejections only. Assignment conflicts are reported separately; both outcomes start a new predicted identity, while a detection with no candidate also starts a new ID.
-- **Confidence rejection:** a detection had candidates, but no candidate reached the method's threshold.
-- **Assignment conflict:** at least one candidate reached the threshold, but the global one-to-one assignment selected another detection for the competing identity. This is not counted as a confidence rejection.
-- **No candidate:** no active identity was available for that detection. This is reported separately and excluded from association coverage.
-- `association_predictions.csv` contains candidate-pair outcomes; `detection_decisions.csv` contains one row per detection, including detections with no candidate.
-- **Association precision:** correct accepted associations divided by all accepted associations.
-- **Association recall:** correct accepted associations divided by current object observations for which a retained memory of that same object was available at frame start.
-- **Association coverage:** accepted matches divided by detections that had at least one memory candidate. Confidence rejections and assignment conflicts are separate counts; no-candidate detections are excluded.
-- **False association rate:** incorrect accepted associations divided by all accepted associations.
-- **Brier score and ECE:** computed only for logistic probability estimates on held-out validation candidate pairs, pooled and per sequence, with candidate-pair counts. Raw-score methods are marked not applicable, not as empty candidate data. Empty probability sets produce undefined (NaN) metrics; single-class Brier/ECE are calculable but have limited class support. No logistic probabilities are assumed calibrated. Raw cosine is a similarity, not a probability, so it is not given Brier/ECE scores.
-- **Precision–coverage curves:** the candidate-pair curve thresholds pair predictions independently. A separate assignment-level curve reruns one-to-one Hungarian assignment at each cutoff using the same frame-level candidate states. Neither is a replacement for tracking metrics.
-- **Tracking confidence-threshold sweep:** each configured threshold replays complete validation sequences with fresh memory and reports identity switches, fragmentation, association precision, and coverage. The sweep is diagnostic; it does not select the configured operating threshold.
-- **Mask-defined absence/reappearance gaps:** identity consistency between observations when every intervening frame has a valid annotation. DAVIS masks show whether an object is present; a gap alone does not distinguish occlusion from leaving the view. No artificial observation removal is performed in this version.
-
-IDF1 and HOTA are omitted because the project does not include a validated implementation for the oracle-mask association protocol. It does not report approximate values under those names.
-
-## Results table template
-
-The following is an empty reporting template, not an experimental result:
-
-| Method | Identity switches | Fragmentations | Association precision | Association recall | Coverage | Brier | ECE |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Cosine forced | — | — | — | — | — | N/A | N/A |
-| Cosine threshold | — | — | — | — | — | N/A | N/A |
-| Motion + appearance | — | — | — | — | — | N/A | N/A |
-| Logistic probability selective | — | — | — | — | — | — | — |
-
-## Reproducibility
-
-Python, NumPy, PyTorch, and CUDA seeds are set from the central configuration. Logistic regression also receives an explicit scikit-learn `random_state`. Training candidate pairs use thresholded-cosine memory replay on training sequences to include rejection-induced new identities. Selective inference uses probability thresholds and can still produce different memory states when geometric features affect decisions; this remaining train/inference shift is documented. Brier score and ECE are evaluated on held-out validation pairs. Candidate-pair, frame-level assignment, and full-tracking threshold sweeps are validation diagnostics only. The configured operating threshold is fixed independently of validation results. The probability method uses six features, while the cosine baseline uses appearance alone, so their comparison evaluates complete methods rather than isolating calibration.
-
-The current project includes a CPU-compatible synthetic end-to-end experiment that requires neither DAVIS nor a pretrained model. Run it with:
-
-```bash
-python -m pytest
-```
-
-Tests do not download pretrained weights or datasets. Full DAVIS runs and GPU inference require the official dataset, PyTorch, and (optionally) a CUDA runtime.
-
-## Limitations
-
-1. Ground-truth masks are detections, so segmentation quality is not evaluated.
-2. DINOv2 features are frozen; this project does not train a new visual representation.
-3. The confidence model is a relatively simple logistic regression model.
-4. DAVIS alone does not establish generalization to other video domains.
-5. Selective rejection can reduce incorrect associations while increasing fragmentation.
-6. Higher association precision alone does not establish better tracking.
-7. Calibration quality is evaluated separately from identity tracking metrics.
-8. Validation sequences are never used to train the calibrator.
-9. Artificially removed observations are not implemented or mixed into mask-defined absence results.
-10. A successful experiment does not establish publication-level novelty.
-11. The pairwise calibration target measures same-object ownership; it is not a direct target for preserving the most recent predicted track ID.
-
-See [`docs/limitations.md`](docs/limitations.md), [`docs/methodology.md`](docs/methodology.md), and [`docs/experimental_protocol.md`](docs/experimental_protocol.md) for the detailed protocol.
+The current results should be discussed as preliminary validation findings, including the fact that selective rejection increased identity switches while geometry-based matching reduced them in this oracle-mask setting.
 
 ## Citation
 
-See [`CITATION.cff`](CITATION.cff) for this repository. Cite the data and frozen backbone using their original publications:
+See [`CITATION.cff`](CITATION.cff). The project uses DAVIS and frozen DINOv2 features; cite their original publications:
 
-- Jordi Pont-Tuset, Federico Perazzi, Sergi Caelles, Pablo Arbeláez, Alexander Sorkine-Hornung, and Luc Van Gool. “The 2017 DAVIS Challenge on Video Object Segmentation.” [arXiv:1704.00675](https://arxiv.org/abs/1704.00675).
-- Maxime Oquab et al. “DINOv2: Learning Robust Visual Features without Supervision.” [arXiv:2304.07193](https://arxiv.org/abs/2304.07193).
-
-This project describes an empirical investigation and makes no unsupported first-use or novelty claim.
-# occlusion-aware-object-centric-learning
+- Jordi Pont-Tuset et al., "The 2017 DAVIS Challenge on Video Object Segmentation." [arXiv:1704.00675](https://arxiv.org/abs/1704.00675).
+- Maxime Oquab et al., "DINOv2: Learning Robust Visual Features without Supervision." [arXiv:2304.07193](https://arxiv.org/abs/2304.07193).

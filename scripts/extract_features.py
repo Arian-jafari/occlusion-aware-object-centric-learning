@@ -39,7 +39,7 @@ def main() -> int:
     overrides = {}
     if args.root:
         overrides["dataset"] = {"root": str(args.root)}
-    if args.batch_size:
+    if args.batch_size is not None:
         overrides.setdefault("features", {})["batch_size"] = args.batch_size
     if args.device:
         overrides.setdefault("features", {})["device"] = args.device

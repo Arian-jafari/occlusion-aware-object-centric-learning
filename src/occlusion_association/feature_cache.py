@@ -71,6 +71,11 @@ class FeatureCache:
     def record_model_revision(self, backbone: str, revision: str) -> None:
         """Record the checkpoint fingerprint used by the current extraction."""
 
+        # Feature extraction calls this once per streamed chunk. Avoid replacing
+        # an unchanged marker on Windows, where another process (for example an
+        # indexer or sync client) may briefly hold the destination file open.
+        if self.model_revision_for(backbone) == str(revision):
+            return
         path = self._model_revision_path(backbone)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(

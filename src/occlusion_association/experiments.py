@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -75,6 +75,8 @@ def _run_method(
     confidence_threshold: float | None = None,
     motion_weights: Mapping[str, float] | None = None,
     frame_limit: int | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_stage: str | None = None,
 ) -> MethodRun:
     """Run a single method over the same masked detections and cached features."""
 
@@ -97,7 +99,10 @@ def _run_method(
     issues: list[DatasetIssue] = []
     processed_frames: dict[str, int] = {}
 
-    for sequence_name in sequence_names:
+    stage = progress_stage or method_name
+    if progress_callback is not None:
+        progress_callback(stage, 0, len(sequence_names))
+    for sequence_number, sequence_name in enumerate(sequence_names, start=1):
         processed_frames[sequence_name] = 0
         memory = ObjectMemory(
             max_gap=gap,
@@ -216,6 +221,8 @@ def _run_method(
                 identity_gt_owner.pop(expired_id, None)
             for detection_id, predicted_id in result.predicted_identity_by_detection.items():
                 identity_gt_owner[predicted_id] = gt_by_detection[detection_id]
+        if progress_callback is not None:
+            progress_callback(stage, sequence_number, len(sequence_names))
 
     per_sequence, aggregate = evaluate_sequences(frame_logs)
     reported_sequences = {row["sequence"] for row in per_sequence}
@@ -280,13 +287,21 @@ def _training_streams(
     sequence_names: Sequence[str],
     frame_limit: int | None,
     issue_log: list[DatasetIssue],
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_stage: str = "calibration training",
 ):
-    for sequence_name in sequence_names:
+    if progress_callback is not None:
+        progress_callback(progress_stage, 0, len(sequence_names))
+    for sequence_number, sequence_name in enumerate(sequence_names, start=1):
         local_issues: list[DatasetIssue] = []
 
-        def frames(name=sequence_name, sink=local_issues):
-            yield from _stream_frames(dataset, name, frame_limit, sink)
-            issue_log.extend(sink)
+        def frames(name=sequence_name, sink=local_issues, number=sequence_number):
+            try:
+                yield from _stream_frames(dataset, name, frame_limit, sink)
+            finally:
+                issue_log.extend(sink)
+                if progress_callback is not None:
+                    progress_callback(progress_stage, number, len(sequence_names))
 
         yield sequence_name, frames()
 
@@ -300,11 +315,19 @@ def _fit_for_gap(
     gap: int,
     frame_limit: int | None,
     issue_log: list[DatasetIssue],
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[CalibrationCandidates, LogisticAssociationCalibrator]:
     features_config = config["features"]
     memory_config = config["memory"]
     candidates = generate_calibration_candidates(
-        _training_streams(dataset, train_names, frame_limit, issue_log),
+        _training_streams(
+            dataset,
+            train_names,
+            frame_limit,
+            issue_log,
+            progress_callback,
+            f"Calibration fit (memory gap {gap})",
+        ),
         cache,
         backbone_name=f"{features_config['torch_hub_repository']}:{features_config['backbone']}",
         preprocessing=build_preprocessing_descriptor(
@@ -340,6 +363,7 @@ def run_experiment_suite(
     frame_limit: int | None = None,
     training_candidates: CalibrationCandidates | None = None,
     fitted_calibrator: LogisticAssociationCalibrator | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Run the main comparison, requested ablations, and validation analyses."""
 
@@ -378,6 +402,7 @@ def run_experiment_suite(
             gap=int(config["memory"]["max_gap"]),
             frame_limit=frame_limit,
             issue_log=all_issues,
+            progress_callback=progress_callback,
         )
     else:
         train_candidates = training_candidates
@@ -404,6 +429,26 @@ def run_experiment_suite(
                 "Provided calibrator was fit with a different candidate memory replay policy: "
                 f"expected {expected_generation_policy!r}, got {calibrator_policy!r}"
             )
+        feature_config = config["features"]
+        expected_backbone = f"{feature_config['torch_hub_repository']}:{feature_config['backbone']}"
+        expected_preprocessing = build_preprocessing_descriptor(
+            int(feature_config["input_size"]),
+            device=str(feature_config["device"]),
+            use_mixed_precision=bool(feature_config["use_mixed_precision"]),
+        )
+        current_revision = cache.model_revision_for(expected_backbone)
+        if current_revision is None:
+            raise ValueError(
+                f"No active feature revision is recorded for {expected_backbone}; extract features first"
+            )
+        if train_candidates.model_revision != current_revision:
+            raise ValueError("Provided calibration candidates use a different feature model revision")
+        if train_candidates.preprocessing != expected_preprocessing:
+            raise ValueError("Provided calibration candidates use different feature preprocessing")
+        if calibrator.metadata.get("feature_model_revision") != current_revision:
+            raise ValueError("Provided calibrator uses a different feature model revision")
+        if calibrator.metadata.get("feature_preprocessing") != expected_preprocessing:
+            raise ValueError("Provided calibrator uses different feature preprocessing")
 
     association_config = config["association"]
     base_weights = dict(association_config["weights"])
@@ -429,6 +474,8 @@ def run_experiment_suite(
             calibrator=model,
             motion_weights=weights,
             frame_limit=frame_limit,
+            progress_callback=progress_callback,
+            progress_stage=f"Main method: {output_name}",
         )
         runs[output_name] = run
         metrics_rows.append(run.aggregate_metrics)
@@ -494,6 +541,8 @@ def run_experiment_suite(
                 calibrator=calibrator,
                 confidence_threshold=threshold,
                 frame_limit=frame_limit,
+                progress_callback=progress_callback,
+                progress_stage=f"Tracking threshold: {threshold:.2f}",
             )
         aggregate_row = dict(threshold_run.aggregate_metrics)
         aggregate_row["confidence_threshold"] = threshold
@@ -519,6 +568,8 @@ def run_experiment_suite(
             config=config,
             motion_weights=weights,
             frame_limit=frame_limit,
+            progress_callback=progress_callback,
+            progress_stage=f"Appearance ablation: {name}",
         )
         row = dict(run.aggregate_metrics)
         row.update({"ablation": "appearance_vs_motion", "weights": weights})
@@ -542,6 +593,7 @@ def run_experiment_suite(
                 gap=gap,
                 frame_limit=frame_limit,
                 issue_log=all_issues,
+                progress_callback=progress_callback,
             )
         run = _run_method(
             dataset,
@@ -553,6 +605,8 @@ def run_experiment_suite(
             calibrator=gap_calibrator,
             max_gap=gap,
             frame_limit=frame_limit,
+            progress_callback=progress_callback,
+            progress_stage=f"Memory gap ablation: {gap}",
         )
         row = dict(run.aggregate_metrics)
         row["max_memory_gap"] = gap

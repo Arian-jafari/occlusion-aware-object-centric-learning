@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
@@ -34,6 +34,7 @@ class CalibrationCandidates:
     metadata: list[dict[str, Any]]
     model_revision: str = "unversioned"
     generation_policy: str = "cosine_threshold"
+    preprocessing: dict[str, Any] = field(default_factory=dict)
 
     @property
     def sequence_names(self) -> set[str]:
@@ -202,6 +203,7 @@ def generate_calibration_candidates(
             if memory_policy == "cosine_threshold"
             else memory_policy
         ),
+        preprocessing=dict(preprocessing),
     )
 
 
@@ -277,6 +279,7 @@ def fit_logistic_calibrator(
         "n_positive_candidates": int(np.sum(candidates.labels == 1)),
         "n_negative_candidates": int(np.sum(candidates.labels == 0)),
         "feature_model_revision": candidates.model_revision,
+        "feature_preprocessing": dict(candidates.preprocessing),
         "candidate_generation_policy": candidates.generation_policy,
         "class_weight": class_weight,
         "probability_note": (
