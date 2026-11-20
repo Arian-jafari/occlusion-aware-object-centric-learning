@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
@@ -32,6 +32,9 @@ class CalibrationCandidates:
     features: np.ndarray
     labels: np.ndarray
     metadata: list[dict[str, Any]]
+    model_revision: str = "unversioned"
+    generation_policy: str = "cosine_threshold"
+    preprocessing: dict[str, Any] = field(default_factory=dict)
 
     @property
     def sequence_names(self) -> set[str]:
@@ -107,21 +110,28 @@ def generate_calibration_candidates(
     preprocessing: dict[str, Any],
     max_gap: int = 30,
     appearance_history_size: int = 5,
+    memory_policy: Literal["cosine_forced", "cosine_threshold"] = "cosine_threshold",
+    cosine_threshold: float = 0.5,
 ) -> CalibrationCandidates:
-    """Generate pair examples by replaying training sequences with forced cosine.
+    """Generate pair examples from a deterministic online memory replay.
 
-    Each training sequence is replayed with forced-cosine association to create
-    realistic predicted-memory candidate states without a learned calibrator.
-    The binary target follows the stated task definition: a candidate is
-    positive exactly when the memory's prior ground-truth owner is the current
+    Thresholded cosine replay mirrors selective inference by allowing uncertain
+    detections to start new identities. A candidate is positive exactly when
+    the memory's prior ground-truth owner is the current
     detection's ground-truth object. Ground-truth labels are used only for that
     target and external ownership bookkeeping; they are not pair features or
-    inference-time decisions.
+    inference-time decisions. A learned probability policy may still produce
+    different memory states; the selected replay policy is recorded for audit.
     """
 
     feature_rows: list[np.ndarray] = []
     labels: list[int] = []
     metadata: list[dict[str, Any]] = []
+    model_revision = cache.model_revision_for(backbone_name)
+    if model_revision is None:
+        raise CalibrationDataError(
+            f"No checkpoint fingerprint is recorded for {backbone_name}; run feature extraction first"
+        )
     for sequence_item in sequences:
         if isinstance(sequence_item, SequenceData):
             sequence_name, sequence_frames = sequence_item.name, iter(sequence_item.frames)
@@ -129,7 +139,11 @@ def generate_calibration_candidates(
             sequence_name, frame_iterable = sequence_item
             sequence_frames = iter(frame_iterable)
         memory = ObjectMemory(max_gap=max_gap, appearance_history_size=appearance_history_size)
-        online = OnlineAssociator(memory, "cosine_forced")
+        online = OnlineAssociator(
+            memory,
+            memory_policy,
+            cosine_threshold=cosine_threshold,
+        )
         ground_truth_owner: dict[int, int] = {}
         for ordinal, frame in enumerate(sequence_frames):
             embeddings, missing = load_cached_frame_embeddings(
@@ -137,6 +151,7 @@ def generate_calibration_candidates(
                 cache,
                 backbone_name=backbone_name,
                 preprocessing=preprocessing,
+                model_revision=model_revision,
             )
             if missing:
                 raise CalibrationDataError(
@@ -178,7 +193,18 @@ def generate_calibration_candidates(
         if feature_rows
         else np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
     )
-    return CalibrationCandidates(matrix, np.asarray(labels, dtype=np.int64), metadata)
+    return CalibrationCandidates(
+        matrix,
+        np.asarray(labels, dtype=np.int64),
+        metadata,
+        model_revision=model_revision,
+        generation_policy=(
+            f"{memory_policy};cosine_threshold={float(cosine_threshold):g}"
+            if memory_policy == "cosine_threshold"
+            else memory_policy
+        ),
+        preprocessing=dict(preprocessing),
+    )
 
 
 def fit_logistic_calibrator(
@@ -186,18 +212,33 @@ def fit_logistic_calibrator(
     *,
     training_sequences: Sequence[str],
     validation_sequences: Sequence[str] = (),
-    class_weight: str | dict[int, float] | None = "balanced",
+    test_sequences: Sequence[str] = (),
+    class_weight: str | dict[int, float] | None = None,
     max_iter: int = 1000,
     random_state: int = 17,
 ) -> LogisticAssociationCalibrator:
-    """Fit a probability model only after checking train/validation isolation."""
+    """Fit probability estimates after checking train/validation/test isolation."""
 
     train_names = set(training_sequences)
     validation_names = set(validation_sequences)
+    test_names = set(test_sequences)
     overlap = train_names & validation_names
     if overlap:
         raise CalibrationDataError(
             f"Training and validation sequence splits overlap: {sorted(overlap)}"
+        )
+    train_test_overlap = train_names & test_names
+    validation_test_overlap = validation_names & test_names
+    if train_test_overlap or validation_test_overlap:
+        raise CalibrationDataError(
+            "Training, validation, and test sequences must be pairwise disjoint: "
+            f"train/test={sorted(train_test_overlap)}, "
+            f"validation/test={sorted(validation_test_overlap)}"
+        )
+    test_candidates = candidates.sequence_names & test_names
+    if test_candidates:
+        raise CalibrationDataError(
+            f"Test sequences cannot enter calibration fitting: {sorted(test_candidates)}"
         )
     unknown = candidates.sequence_names - train_names
     if unknown:
@@ -237,7 +278,14 @@ def fit_logistic_calibrator(
         "n_training_candidates": int(candidates.labels.size),
         "n_positive_candidates": int(np.sum(candidates.labels == 1)),
         "n_negative_candidates": int(np.sum(candidates.labels == 0)),
+        "feature_model_revision": candidates.model_revision,
+        "feature_preprocessing": dict(candidates.preprocessing),
+        "candidate_generation_policy": candidates.generation_policy,
         "class_weight": class_weight,
+        "probability_note": (
+            "Probabilities are not assumed calibrated; evaluate on held-out sequences "
+            "with Brier score and ECE. Non-null class weights alter the fitted class prior."
+        ),
         "max_iter": int(max_iter),
         "random_state": int(random_state),
     }

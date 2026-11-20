@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -115,6 +116,52 @@ def load_config(
         raise ConfigError("memory.max_gap must be a positive integer")
     if int(loaded["evaluation"].get("ece_bins", 0)) < 1:
         raise ConfigError("evaluation.ece_bins must be a positive integer")
+    if int(loaded["features"].get("batch_size", 0)) < 1:
+        raise ConfigError("features.batch_size must be a positive integer")
+    for key, bounds in (
+        ("cosine_threshold", (-1.0, 1.0)),
+        ("fixed_score_threshold", (0.0, 1.0)),
+        ("confidence_threshold", (0.0, 1.0)),
+    ):
+        try:
+            value = float(loaded["association"][key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ConfigError(f"association.{key} must be a finite number") from exc
+        if not math.isfinite(value) or not bounds[0] <= value <= bounds[1]:
+            raise ConfigError(f"association.{key} must be between {bounds[0]} and {bounds[1]}")
+    weights = loaded["association"].get("weights")
+    if not isinstance(weights, dict):
+        raise ConfigError("association.weights must be a mapping")
+    weight_values = []
+    for key in ("appearance", "center_displacement", "bbox_iou", "area_ratio"):
+        try:
+            value = float(weights.get(key, 0.0))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"association.weights.{key} must be finite and nonnegative") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ConfigError(f"association.weights.{key} must be finite and nonnegative")
+        weight_values.append(value)
+    if sum(weight_values) <= 0:
+        raise ConfigError("At least one association weight must be positive")
+    for key in ("confidence_thresholds", "tracking_confidence_thresholds"):
+        values = loaded["evaluation"].get(key, [])
+        if not isinstance(values, list):
+            raise ConfigError(f"evaluation.{key} must be a list of values in [0, 1]")
+        try:
+            valid = all(math.isfinite(float(value)) and 0 <= float(value) <= 1 for value in values)
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise ConfigError(f"evaluation.{key} values must be finite and in [0, 1]")
+    class_weight = loaded["calibration"].get("class_weight")
+    if (
+        class_weight is not None
+        and class_weight != "balanced"
+        and not isinstance(class_weight, dict)
+    ):
+        raise ConfigError(
+            "calibration.class_weight must be null, 'balanced', or a class-weight mapping"
+        )
 
     return ProjectConfig(
         **{name: loaded[name] for name in _SECTION_NAMES},

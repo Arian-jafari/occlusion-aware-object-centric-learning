@@ -16,7 +16,7 @@ The default backbone is the official pretrained `facebookresearch/dinov2` `dinov
 
 Only `x_norm_patchtokens` are used. The CLS/global token is rejected as an object representation. For each mask, a binary coverage image is resized to the feature image dimensions using area resampling. Its fractional occupancy is averaged inside each 14×14 patch. Patch tokens are averaged with those occupancy weights and L2-normalized. Empty, non-finite, or zero-norm results return `None` and are reported by extraction. Partial coverage preserves small objects that touch very few patches.
 
-Each cache key includes schema version, sequence, frame, mask object label, backbone repository/name, resize and normalization settings, input size, device type, and precision mode. Cache files are atomic NumPy arrays outside the repository. No checkpoint is copied into source control.
+Each cache key includes schema version, sequence, frame, mask object label, backbone repository/name, resize and normalization settings, input size, device type, precision mode, decoded RGB image-content digest, mask-content digest, and SHA-256 of the exact model state dictionary. Feature extraction records the checkpoint fingerprint for later calibration and experiment cache reads. Cache files are atomic NumPy arrays outside the repository. No checkpoint is copied into source control.
 
 ## Detections and deterministic ordering
 
@@ -24,13 +24,13 @@ For every mask object, geometry consists of pixel-center centroid, half-open `(x
 
 ## Memory
 
-Each predicted identity stores its own generated predicted ID, latest normalized embedding, previous center/box/area, most recent observation frame, age, missing-frame count, and bounded optional appearance history. With maximum gap `N`, an identity can match a reappearance after `N` complete absent frames. It expires before an observation after more than `N` missing frames. Rejection does not delete the old identity; the detection receives a new predicted ID and the old identity stays until expiry.
+Each predicted identity stores its generated predicted ID, an L2-normalized mean prototype over the last `appearance_history_size` normalized embeddings, previous center/box/area, most recent observation frame, age, missing-frame count, and the bounded embedding history. The mean prototype reduces sensitivity to one noisy observation; when the mean nearly cancels, the latest embedding is used. A history size of one recovers latest-embedding matching. With maximum gap `N`, an identity can match a reappearance after `N` complete absent frames. It expires before an observation after more than `N` missing frames. Rejection does not delete the old identity; the detection receives a new predicted ID and the old identity stays until expiry.
 
 ## Association features
 
 | Feature | Definition | Range |
 |---|---|---:|
-| Cosine similarity | Cosine between latest memory embedding and current embedding | `[-1, 1]` |
+| Cosine similarity | Cosine between the bounded-history prototype and current embedding | `[-1, 1]` |
 | Center displacement | Euclidean centroid distance divided by image diagonal, clipped | `[0, 1]` |
 | Bounding-box IoU | IoU between previous and current half-open boxes | `[0, 1]` |
 | Area ratio | `min(previous area,current area)/max(...)` | `[0, 1]` |
@@ -41,24 +41,30 @@ The geometry uses the last observed center and box without learned motion extrap
 
 ## Decision rules
 
-All methods use one-to-one Hungarian assignment over the current active identities and detections.
+All methods use one-to-one assignment over current active identities and detections. Forced cosine uses rectangular Hungarian assignment and accepts every selected pair. Thresholded methods include unmatched identity and detection choices using dummy rows and columns. An eligible edge has utility `score - threshold`; an unmatched identity or detection has utility zero. This makes the configured threshold the explicit unmatched alternative and keeps match decisions invariant when the same constant is added to all scores and the threshold. Edges below threshold are ineligible before optimization.
 
-- **Cosine forced:** maximize cosine and accept every selected pair.
-- **Cosine threshold:** maximize cosine and reject selected pairs below the configured cosine threshold.
-- **Motion + appearance:** combine normalized cosine, center proximity, box IoU, and optionally area ratio by nonnegative configurable weights; reject selected scores below a fixed threshold.
-- **Calibrated selective:** score all candidate feature rows with the fitted logistic regression, maximize those probabilities, accept above the configured confidence threshold, and explicitly reject selected assignments below it.
+- **Cosine forced:** maximize cosine with rectangular Hungarian assignment and accept every selected pair.
+- **Cosine threshold:** compare cosine scores with the configured cosine threshold and globally assign eligible pairs relative to the unmatched option.
+- **Motion + appearance:** combine normalized cosine, center proximity, box IoU, and optionally area ratio by nonnegative configurable weights; compare the resulting scores with the fixed unmatched threshold.
+- **Logistic-probability selective:** estimate pair-correctness probabilities with logistic regression, compare them with the confidence threshold, and globally assign eligible pairs relative to the unmatched option. Held-out metrics assess calibration; the method name does not imply that calibration is guaranteed.
 
-Each rejected detection starts a new predicted identity. Unassigned detections also start new identities. Existing unassigned identities remain in memory until expiry.
+Pair-level outcomes are accepted, below-threshold, or eligible but lost to the one-to-one assignment. Detection-level outcomes are accepted, confidence rejection (no eligible pair), assignment conflict (eligible pair but no selected match), or no candidate (no active identity). Every unmatched detection starts a new predicted identity. Confidence rejections, assignment conflicts, and detections with no candidate are counted separately. Unmatched identities remain in memory until expiry.
 
 ## Training examples and probability model
 
-Candidate data are generated by replaying each training sequence with forced-cosine matching. For a pair, the target is positive if the predicted memory identity's previous ground-truth owner matches the current detection's ground-truth object. Ground-truth owner bookkeeping is external to the feature vector and is consulted only for target creation. This trains on the same forced-matching memory distribution for every run. StandardScaler plus logistic regression is fit with configurable class weighting (default `balanced`), iteration limit, and random state. Both classes must be present. Validation sequence names are explicitly checked against the training set, and validation labels never enter fitting.
+Candidate data are generated by replaying training sequences with thresholded-cosine association at the configured cosine cutoff. This allows low-similarity detections to start new identities during training replay, as they can during selective inference. The correctness target is positive when the candidate memory identity's prior ground-truth owner matches the current detection. Ground-truth ownership is used only for target creation. This target measures same-object association, not whether the candidate is the most recently assigned predicted ID for that object. Since rejection may leave multiple active predicted identities with the same ground-truth owner, pair-level calibration must be interpreted separately from identity-switch counts. StandardScaler plus unweighted logistic regression is the default; optional class weights are retained for sensitivity analyses because they change the fitted class prior. The model is fit with configurable iteration limit and random state. Both classes must be present. Training names must belong to the official train list; validation names are checked separately and validation labels never enter fitting.
 
-Logistic regression provides a probability estimate; it does not guarantee that those probabilities are calibrated. Brier score, ECE, and reliability diagrams are computed only on held-out validation candidate pairs.
+This replay reduces, but does not eliminate, training/inference memory-state mismatch. Selective inference uses learned probabilities and geometric features, while candidate generation uses a cosine cutoff. A different accepted match changes later identity prototypes, ages, and pair features. The resulting distribution shift can be material across long sequences; no iterative calibration claim is made.
+
+Logistic regression provides probability estimates; it does not guarantee that they are calibrated, even without class weighting. Brier score, ECE, and reliability diagrams are computed only for these estimates on held-out validation candidate pairs. The report includes pooled and per-sequence scores and candidate counts. Raw-score methods are marked not applicable rather than reported as empty candidate data. Brier/ECE are undefined (NaN) for empty probability sets; they can be computed for single-class data, which is marked as limited class support. Association similarities are never passed to calibration metrics as probabilities. The raw-cosine versus logistic comparison also changes the feature set and therefore does not isolate calibration as the source of any tracking difference.
 
 ## Metrics and reporting
 
-Identity switches count predicted-ID changes between consecutive observed frames of one ground-truth object; the first observation is excluded. A fragmentation counts an identity change after at least one intervening valid annotated frame in which the object is absent. An interval with missing/invalid source frames is not counted as natural occlusion fragmentation. Candidate coverage in the precision/coverage curve is accepted candidate pairs divided by all validation candidate pairs; reported association coverage is accepted Hungarian assignments divided by all selected Hungarian decisions before rejection.
+Identity switches count predicted-ID changes between consecutive observed frames of one ground-truth object; the first observation is excluded. A fragmentation counts an identity change after at least one intervening valid annotated frame in which the object is absent. These are mask-defined absence/reappearance gaps; the masks do not distinguish occlusion from leaving the view. The candidate-pair precision/coverage curve thresholds pair predictions independently. The separate assignment-level curve reruns one-to-one assignment at each probability threshold using the logged per-frame candidate states. A tracking-threshold sweep replays complete validation sequences from fresh memory at each configured threshold and reports identity switches, fragmentation, association precision, and coverage. The sweep is diagnostic and does not select the operating threshold. Reported tracking coverage is accepted matches divided by detections with at least one memory candidate; confidence rejections and assignment conflicts remain separate.
+
+The legacy `rejected_associations` counter now means confidence rejections only: candidate detections for which no pair reached threshold. Assignment conflicts are counted separately and are not included in that counter. `association_assignment_decisions` is the number of detections with at least one candidate, so its coverage denominator excludes no-candidate detections.
+
+The current loader uses DAVIS 2017 TrainVal's official train and validation lists. The runner does not define an additional test split because this configured data does not provide an independent labeled test set. Validation metrics are therefore held-out validation results, not an untouched test estimate.
 
 Association precision is correct accepted pairs divided by accepted pairs. Recall is correct accepted pairs divided by current object observations that had an active memory identity of that same object. False association rate is incorrect accepted pairs divided by accepted pairs. Counts and denominators are written so these rates can be audited.
 

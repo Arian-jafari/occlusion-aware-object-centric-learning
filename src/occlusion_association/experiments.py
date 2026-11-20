@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -19,6 +19,7 @@ from .calibration import (
 from .dataset import DAVISDataset, DatasetIssue, FrameData
 from .evaluation import (
     FrameEvaluationLog,
+    assignment_precision_coverage_curve,
     calibration_metrics,
     candidate_targets_and_probabilities,
     evaluate_sequences,
@@ -33,13 +34,14 @@ from .object_representation import build_object_detections
 
 @dataclass
 class MethodRun:
-    """Frame logs, metrics, and pair-level output for one method."""
+    """Frame logs, metrics, and pair-/detection-level outputs for one method."""
 
     method_name: str
     per_sequence_metrics: list[dict[str, Any]]
     aggregate_metrics: dict[str, Any]
     frame_logs: list[FrameEvaluationLog]
     association_rows: list[dict[str, Any]]
+    detection_rows: list[dict[str, Any]]
     issues: list[DatasetIssue]
 
 
@@ -73,6 +75,8 @@ def _run_method(
     confidence_threshold: float | None = None,
     motion_weights: Mapping[str, float] | None = None,
     frame_limit: int | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_stage: str | None = None,
 ) -> MethodRun:
     """Run a single method over the same masked detections and cached features."""
 
@@ -91,10 +95,14 @@ def _run_method(
     )
     frame_logs: list[FrameEvaluationLog] = []
     association_rows: list[dict[str, Any]] = []
+    detection_rows: list[dict[str, Any]] = []
     issues: list[DatasetIssue] = []
     processed_frames: dict[str, int] = {}
 
-    for sequence_name in sequence_names:
+    stage = progress_stage or method_name
+    if progress_callback is not None:
+        progress_callback(stage, 0, len(sequence_names))
+    for sequence_number, sequence_name in enumerate(sequence_names, start=1):
         processed_frames[sequence_name] = 0
         memory = ObjectMemory(
             max_gap=gap,
@@ -152,6 +160,32 @@ def _run_method(
                     result=result,
                 )
             )
+            accepted_identity_by_detection = {
+                assignment.detection_id: assignment.predicted_identity_id
+                for assignment in result.decision.accepted
+            }
+            candidate_count_by_detection = {detection_id: 0 for detection_id in gt_by_detection}
+            eligible_count_by_detection = {detection_id: 0 for detection_id in gt_by_detection}
+            for (predicted_id, detection_id), pair_outcome in result.decision.pair_outcomes.items():
+                candidate_count_by_detection[detection_id] += 1
+                if pair_outcome != "below_threshold":
+                    eligible_count_by_detection[detection_id] += 1
+            for detection_id, outcome in result.decision.detection_outcomes.items():
+                detection_rows.append(
+                    {
+                        "method": method_name,
+                        "sequence": sequence_name,
+                        "frame": frame.frame_name,
+                        "detection_id": detection_id,
+                        "outcome": outcome,
+                        "candidate_pair_count": candidate_count_by_detection[detection_id],
+                        "eligible_candidate_pair_count": eligible_count_by_detection[detection_id],
+                        "accepted_identity_id": accepted_identity_by_detection.get(detection_id),
+                        "new_predicted_identity_id": result.new_identity_by_detection.get(
+                            detection_id
+                        ),
+                    }
+                )
             selected = {
                 (assignment.predicted_identity_id, assignment.detection_id): assignment
                 for assignment in result.decision.assignments
@@ -170,6 +204,12 @@ def _run_method(
                     "score_kind": "probability" if method == "calibrated_selective" else "association_score",
                     "hungarian_selected": assignment is not None,
                     "accepted_for_memory": bool(assignment and assignment.accepted),
+                    "pair_outcome": result.decision.pair_outcomes[pair],
+                    "detection_outcome": result.decision.detection_outcomes[detection_id],
+                    "detection_rejected": result.decision.detection_outcomes[detection_id]
+                    == "confidence_rejection",
+                    "detection_assignment_conflict": result.decision.detection_outcomes[detection_id]
+                    == "assignment_conflict",
                     "pair_correct": int(
                         owner_before.get(predicted_id) == gt_by_detection[detection_id]
                     ),
@@ -181,6 +221,8 @@ def _run_method(
                 identity_gt_owner.pop(expired_id, None)
             for detection_id, predicted_id in result.predicted_identity_by_detection.items():
                 identity_gt_owner[predicted_id] = gt_by_detection[detection_id]
+        if progress_callback is not None:
+            progress_callback(stage, sequence_number, len(sequence_names))
 
     per_sequence, aggregate = evaluate_sequences(frame_logs)
     reported_sequences = {row["sequence"] for row in per_sequence}
@@ -195,6 +237,9 @@ def _run_method(
                     "correct_associations": 0,
                     "incorrect_associations": 0,
                     "rejected_associations": 0,
+                    "confidence_rejections": 0,
+                    "assignment_conflicts": 0,
+                    "no_candidate_detections": 0,
                     "new_predicted_identities": 0,
                     "eligible_gt_transitions": 0,
                     "association_assignment_decisions": 0,
@@ -204,6 +249,13 @@ def _run_method(
                     "association_f1": float("nan"),
                     "association_coverage": float("nan"),
                     "false_association_rate": float("nan"),
+                    "brier_score": float("nan"),
+                    "ece": float("nan"),
+                    "calibration_candidate_pairs": 0,
+                    "association_candidate_pairs": 0,
+                    "calibration_positive_candidate_pairs": 0,
+                    "calibration_negative_candidate_pairs": 0,
+                    "calibration_status": "not_applicable_no_processed_frames",
                     "occlusion_gaps": [],
                     "candidate_labels": [],
                     "candidate_probabilities": [],
@@ -225,6 +277,7 @@ def _run_method(
         aggregate_metrics=aggregate,
         frame_logs=frame_logs,
         association_rows=association_rows,
+        detection_rows=detection_rows,
         issues=issues,
     )
 
@@ -234,13 +287,21 @@ def _training_streams(
     sequence_names: Sequence[str],
     frame_limit: int | None,
     issue_log: list[DatasetIssue],
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_stage: str = "calibration training",
 ):
-    for sequence_name in sequence_names:
+    if progress_callback is not None:
+        progress_callback(progress_stage, 0, len(sequence_names))
+    for sequence_number, sequence_name in enumerate(sequence_names, start=1):
         local_issues: list[DatasetIssue] = []
 
-        def frames(name=sequence_name, sink=local_issues):
-            yield from _stream_frames(dataset, name, frame_limit, sink)
-            issue_log.extend(sink)
+        def frames(name=sequence_name, sink=local_issues, number=sequence_number):
+            try:
+                yield from _stream_frames(dataset, name, frame_limit, sink)
+            finally:
+                issue_log.extend(sink)
+                if progress_callback is not None:
+                    progress_callback(progress_stage, number, len(sequence_names))
 
         yield sequence_name, frames()
 
@@ -254,11 +315,19 @@ def _fit_for_gap(
     gap: int,
     frame_limit: int | None,
     issue_log: list[DatasetIssue],
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[CalibrationCandidates, LogisticAssociationCalibrator]:
     features_config = config["features"]
     memory_config = config["memory"]
     candidates = generate_calibration_candidates(
-        _training_streams(dataset, train_names, frame_limit, issue_log),
+        _training_streams(
+            dataset,
+            train_names,
+            frame_limit,
+            issue_log,
+            progress_callback,
+            f"Calibration fit (memory gap {gap})",
+        ),
         cache,
         backbone_name=f"{features_config['torch_hub_repository']}:{features_config['backbone']}",
         preprocessing=build_preprocessing_descriptor(
@@ -268,6 +337,8 @@ def _fit_for_gap(
         ),
         max_gap=gap,
         appearance_history_size=int(memory_config["appearance_history_size"]),
+        memory_policy="cosine_threshold",
+        cosine_threshold=float(config["association"]["cosine_threshold"]),
     )
     calibrator = fit_logistic_calibrator(
         candidates,
@@ -292,11 +363,30 @@ def run_experiment_suite(
     frame_limit: int | None = None,
     training_candidates: CalibrationCandidates | None = None,
     fitted_calibrator: LogisticAssociationCalibrator | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Run the main comparison, requested ablations, and validation analyses."""
 
-    train_names = list(train_sequence_names or dataset.train_sequences)
-    val_names = list(validation_sequence_names or dataset.validation_sequences)
+    train_names = list(
+        dataset.train_sequences if train_sequence_names is None else train_sequence_names
+    )
+    val_names = list(
+        dataset.validation_sequences
+        if validation_sequence_names is None
+        else validation_sequence_names
+    )
+    invalid_train_names = set(train_names) - set(dataset.train_sequences)
+    invalid_validation_names = set(val_names) - set(dataset.validation_sequences)
+    if invalid_train_names:
+        raise ValueError(
+            "Calibration training sequences must belong to the official training split: "
+            f"{sorted(invalid_train_names)}"
+        )
+    if invalid_validation_names:
+        raise ValueError(
+            "Evaluation sequences must belong to the official validation split: "
+            f"{sorted(invalid_validation_names)}"
+        )
     if set(train_names) & set(val_names):
         raise ValueError("Training and validation sequences must be disjoint")
     all_issues: list[DatasetIssue] = []
@@ -312,16 +402,53 @@ def run_experiment_suite(
             gap=int(config["memory"]["max_gap"]),
             frame_limit=frame_limit,
             issue_log=all_issues,
+            progress_callback=progress_callback,
         )
     else:
         train_candidates = training_candidates
         calibrator = fitted_calibrator
         if train_candidates.sequence_names - set(train_names):
             raise ValueError("Provided calibration candidates contain non-training sequences")
+        expected_generation_policy = (
+            "cosine_threshold;cosine_threshold="
+            f"{float(config['association']['cosine_threshold']):g}"
+        )
+        if train_candidates.generation_policy != expected_generation_policy:
+            raise ValueError(
+                "Provided calibration candidates use a different memory replay policy: "
+                f"expected {expected_generation_policy!r}, "
+                f"got {train_candidates.generation_policy!r}"
+            )
         if set(calibrator.metadata.get("training_sequences", ())) != set(train_names):
             raise ValueError("Provided calibrator training sequences do not match this run")
         if calibrator.metadata.get("validation_sequences_used_for_fit"):
             raise ValueError("Provided calibrator metadata shows validation data was used for fitting")
+        calibrator_policy = calibrator.metadata.get("candidate_generation_policy")
+        if calibrator_policy is not None and calibrator_policy != expected_generation_policy:
+            raise ValueError(
+                "Provided calibrator was fit with a different candidate memory replay policy: "
+                f"expected {expected_generation_policy!r}, got {calibrator_policy!r}"
+            )
+        feature_config = config["features"]
+        expected_backbone = f"{feature_config['torch_hub_repository']}:{feature_config['backbone']}"
+        expected_preprocessing = build_preprocessing_descriptor(
+            int(feature_config["input_size"]),
+            device=str(feature_config["device"]),
+            use_mixed_precision=bool(feature_config["use_mixed_precision"]),
+        )
+        current_revision = cache.model_revision_for(expected_backbone)
+        if current_revision is None:
+            raise ValueError(
+                f"No active feature revision is recorded for {expected_backbone}; extract features first"
+            )
+        if train_candidates.model_revision != current_revision:
+            raise ValueError("Provided calibration candidates use a different feature model revision")
+        if train_candidates.preprocessing != expected_preprocessing:
+            raise ValueError("Provided calibration candidates use different feature preprocessing")
+        if calibrator.metadata.get("feature_model_revision") != current_revision:
+            raise ValueError("Provided calibrator uses a different feature model revision")
+        if calibrator.metadata.get("feature_preprocessing") != expected_preprocessing:
+            raise ValueError("Provided calibrator uses different feature preprocessing")
 
     association_config = config["association"]
     base_weights = dict(association_config["weights"])
@@ -333,6 +460,7 @@ def run_experiment_suite(
     ]
     runs: dict[str, MethodRun] = {}
     association_rows: list[dict[str, Any]] = []
+    detection_rows: list[dict[str, Any]] = []
     per_sequence_rows: list[dict[str, Any]] = []
     metrics_rows: list[dict[str, Any]] = []
     for output_name, method, model, weights in method_specs:
@@ -346,11 +474,14 @@ def run_experiment_suite(
             calibrator=model,
             motion_weights=weights,
             frame_limit=frame_limit,
+            progress_callback=progress_callback,
+            progress_stage=f"Main method: {output_name}",
         )
         runs[output_name] = run
         metrics_rows.append(run.aggregate_metrics)
         per_sequence_rows.extend(run.per_sequence_metrics)
         association_rows.extend(run.association_rows)
+        detection_rows.extend(run.detection_rows)
         all_issues.extend(run.issues)
 
     proposed_logs = runs["calibrated_selective"].frame_logs
@@ -363,11 +494,63 @@ def run_experiment_suite(
     calibration_report["evaluation_sequences"] = val_names
     calibration_report["calibrator_training_sequences"] = train_names
     calibration_report["feature_names"] = list(calibrator.metadata["feature_names"])
+    calibration_report["metric_scope"] = "pooled_validation_candidate_pairs"
+    calibration_report["probability_interpretation"] = (
+        "Logistic-regression probability estimates; calibration is assessed on held-out data."
+    )
     curve = precision_coverage_curve(
         val_labels,
         val_probabilities,
         config["evaluation"]["confidence_thresholds"],
     )
+    assignment_curve = assignment_precision_coverage_curve(
+        proposed_logs,
+        config["evaluation"]["confidence_thresholds"],
+    )
+
+    # Re-run the entire validation trajectory at each configured threshold.
+    # Reusing the main run at its operating threshold avoids an extra pass and
+    # keeps this sweep aligned with the actual stateful tracking policy.
+    operating_threshold = float(association_config["confidence_threshold"])
+    tracking_thresholds = [
+        float(value)
+        for value in config["evaluation"].get("tracking_confidence_thresholds", ())
+    ]
+    if not any(np.isclose(value, operating_threshold) for value in tracking_thresholds):
+        tracking_thresholds.append(operating_threshold)
+    unique_tracking_thresholds: list[float] = []
+    for threshold in tracking_thresholds:
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("Tracking confidence thresholds must be in [0, 1]")
+        if not any(np.isclose(threshold, seen) for seen in unique_tracking_thresholds):
+            unique_tracking_thresholds.append(threshold)
+
+    tracking_threshold_metrics: list[dict[str, Any]] = []
+    tracking_threshold_per_sequence_metrics: list[dict[str, Any]] = []
+    for threshold in unique_tracking_thresholds:
+        if np.isclose(threshold, operating_threshold):
+            threshold_run = runs["calibrated_selective"]
+        else:
+            threshold_run = _run_method(
+                dataset,
+                val_names,
+                cache,
+                method_name="calibrated_selective",
+                method="calibrated_selective",
+                config=config,
+                calibrator=calibrator,
+                confidence_threshold=threshold,
+                frame_limit=frame_limit,
+                progress_callback=progress_callback,
+                progress_stage=f"Tracking threshold: {threshold:.2f}",
+            )
+        aggregate_row = dict(threshold_run.aggregate_metrics)
+        aggregate_row["confidence_threshold"] = threshold
+        tracking_threshold_metrics.append(aggregate_row)
+        tracking_threshold_per_sequence_metrics.extend(
+            {**row, "confidence_threshold": threshold}
+            for row in threshold_run.per_sequence_metrics
+        )
 
     appearance_ablation_specs = [
         ("appearance_only", {"appearance": 1.0, "center_displacement": 0.0, "bbox_iou": 0.0, "area_ratio": 0.0}),
@@ -385,6 +568,8 @@ def run_experiment_suite(
             config=config,
             motion_weights=weights,
             frame_limit=frame_limit,
+            progress_callback=progress_callback,
+            progress_stage=f"Appearance ablation: {name}",
         )
         row = dict(run.aggregate_metrics)
         row.update({"ablation": "appearance_vs_motion", "weights": weights})
@@ -408,6 +593,7 @@ def run_experiment_suite(
                 gap=gap,
                 frame_limit=frame_limit,
                 issue_log=all_issues,
+                progress_callback=progress_callback,
             )
         run = _run_method(
             dataset,
@@ -419,6 +605,8 @@ def run_experiment_suite(
             calibrator=gap_calibrator,
             max_gap=gap,
             frame_limit=frame_limit,
+            progress_callback=progress_callback,
+            progress_stage=f"Memory gap ablation: {gap}",
         )
         row = dict(run.aggregate_metrics)
         row["max_memory_gap"] = gap
@@ -457,6 +645,7 @@ def run_experiment_suite(
         "metrics": metrics_rows,
         "per_sequence_metrics": per_sequence_rows,
         "association_predictions": association_rows,
+        "detection_decisions": detection_rows,
         "calibration_candidates": [
             {
                 "sequence": log.sequence,
@@ -489,6 +678,10 @@ def run_experiment_suite(
         ],
         "calibration_metrics": calibration_report,
         "precision_coverage_curve": curve,
+        "precision_coverage_curve_level": "candidate_pair",
+        "assignment_precision_coverage_curve": assignment_curve,
+        "tracking_confidence_threshold_metrics": tracking_threshold_metrics,
+        "tracking_confidence_threshold_per_sequence_metrics": tracking_threshold_per_sequence_metrics,
         "occlusion_gap_metrics": gap_results,
         "appearance_ablation": appearance_rows,
         "calibration_ablation": calibration_ablation,
@@ -498,7 +691,12 @@ def run_experiment_suite(
             "positive_candidates": int(np.sum(train_candidates.labels == 1)),
             "negative_candidates": int(np.sum(train_candidates.labels == 0)),
             "sequences": sorted(train_candidates.sequence_names),
-            "candidate_generation_policy": "cosine_forced_online_memory; training sequences only",
+            "candidate_generation_policy": train_candidates.generation_policy,
+            "memory_policy_note": (
+                "Training replay uses thresholded cosine memory to include rejection-induced "
+                "new identities. Inference uses calibrated probability decisions, so memory "
+                "states can still differ when geometric features change those decisions."
+            ),
         },
         "calibrator_metadata": calibrator.metadata,
         "calibrator": calibrator,

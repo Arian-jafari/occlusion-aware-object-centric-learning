@@ -1,8 +1,8 @@
-"""Hungarian association baselines and calibrated selective decisions."""
+"""Hungarian association baselines and logistic-probability selective decisions."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
 import numpy as np
@@ -23,6 +23,10 @@ AssociationMethod = Literal[
     "motion_appearance",
     "calibrated_selective",
 ]
+PairOutcome = Literal["accepted", "below_threshold", "assignment_conflict"]
+DetectionOutcome = Literal[
+    "accepted", "confidence_rejection", "assignment_conflict", "no_candidate"
+]
 
 
 @dataclass(frozen=True)
@@ -37,7 +41,13 @@ class AssignedPair:
 
 @dataclass
 class AssociationDecision:
-    """Selected pair assignments plus explicit rejections and unmatched items."""
+    """Pair-level and detection-level outcomes for one association decision.
+
+    ``rejected`` is retained for compatibility with the former post-assignment
+    threshold API; threshold-aware assignment does not select rejected pairs.
+    Detection rejection IDs contain confidence rejections only. Assignment
+    conflicts and detections without a candidate have separate fields.
+    """
 
     method: str
     assignments: list[AssignedPair]
@@ -46,6 +56,12 @@ class AssociationDecision:
     unmatched_detection_ids: list[int]
     unmatched_identity_ids: list[int]
     candidate_scores: dict[tuple[int, int], float]
+    rejected_detection_ids: list[int] = field(default_factory=list)
+    assignment_conflict_detection_ids: list[int] = field(default_factory=list)
+    no_candidate_detection_ids: list[int] = field(default_factory=list)
+    pair_outcomes: dict[tuple[int, int], PairOutcome] = field(default_factory=dict)
+    detection_outcomes: dict[int, DetectionOutcome] = field(default_factory=dict)
+    score_kind: Literal["probability", "association_score"] = "association_score"
 
 
 @dataclass
@@ -78,6 +94,47 @@ def _hungarian_assign(
     return [
         (identity_ids[row], detection_ids[column])
         for row, column in zip(row_indices.tolist(), column_indices.tolist())
+    ]
+
+
+def _hungarian_assign_with_unmatched(
+    score_map: Mapping[tuple[int, int], float],
+    identity_ids: list[int],
+    detection_ids: list[int],
+    threshold: float,
+) -> list[tuple[int, int]]:
+    """Maximize score gain over the unmatched option under one-to-one matching.
+
+    The augmented square matrix has one dummy column per identity and one
+    dummy row per detection. Scores below the acceptance threshold are made
+    infeasible. Each unmatched choice has utility zero, and an eligible edge
+    has utility ``score - threshold``. Thus the threshold is the explicit
+    unmatched alternative: an edge is preferred only to the extent that it
+    exceeds that alternative. Shifting all scores and the threshold by the
+    same constant leaves the objective unchanged.
+    """
+
+    if not identity_ids or not detection_ids:
+        return []
+    identity_count, detection_count = len(identity_ids), len(detection_ids)
+    matrix = np.zeros(
+        (identity_count + detection_count, detection_count + identity_count),
+        dtype=np.float64,
+    )
+    matrix[:identity_count, :detection_count] = -1e12
+    for row, identity_id in enumerate(identity_ids):
+        for column, detection_id in enumerate(detection_ids):
+            score = float(score_map[(identity_id, detection_id)])
+            if score >= threshold:
+                matrix[row, column] = score - threshold
+
+    row_indices, column_indices = linear_sum_assignment(-matrix)
+    return [
+        (identity_ids[row], detection_ids[column])
+        for row, column in zip(row_indices.tolist(), column_indices.tolist())
+        if row < identity_count
+        and column < detection_count
+        and score_map[(identity_ids[row], detection_ids[column])] >= threshold
     ]
 
 
@@ -116,7 +173,7 @@ def decide_associations(
     motion_weights: Mapping[str, float] | None = None,
     calibrator: Any | None = None,
 ) -> AssociationDecision:
-    """Select pairs by Hungarian assignment, then apply explicit rejection.
+    """Select eligible pairs with optional unmatched identity/detection choices.
 
     The feature calculation itself lives in ``association_features`` and is
     independent of these decision rules.
@@ -160,29 +217,85 @@ def decide_associations(
     else:
         candidate_scores = _calibrated_probabilities(calibrator, feature_map)
 
-    selected_pairs = _hungarian_assign(candidate_scores, identity_ids, detection_ids)
+    if method == "cosine_forced":
+        selected_pairs = _hungarian_assign(candidate_scores, identity_ids, detection_ids)
+    else:
+        threshold = {
+            "cosine_threshold": cosine_threshold,
+            "motion_appearance": fixed_score_threshold,
+            "calibrated_selective": confidence_threshold,
+        }[method]
+        selected_pairs = _hungarian_assign_with_unmatched(
+            candidate_scores, identity_ids, detection_ids, threshold
+        )
     assignments: list[AssignedPair] = []
     for identity_id, detection_id in selected_pairs:
         score = candidate_scores[(identity_id, detection_id)]
-        if method == "cosine_forced":
-            accepted = True
-        elif method == "cosine_threshold":
-            accepted = score >= cosine_threshold
-        elif method == "motion_appearance":
-            accepted = score >= fixed_score_threshold
-        else:
-            accepted = score >= confidence_threshold
-        assignments.append(AssignedPair(identity_id, detection_id, score, accepted))
+        assignments.append(AssignedPair(identity_id, detection_id, score, True))
 
-    accepted = [assignment for assignment in assignments if assignment.accepted]
-    rejected = [assignment for assignment in assignments if not assignment.accepted]
+    accepted = assignments
+    rejected: list[AssignedPair] = []
     accepted_detections = {assignment.detection_id for assignment in accepted}
     accepted_identities = {assignment.predicted_identity_id for assignment in accepted}
+    threshold = None if method == "cosine_forced" else {
+        "cosine_threshold": cosine_threshold,
+        "motion_appearance": fixed_score_threshold,
+        "calibrated_selective": confidence_threshold,
+    }[method]
+    selected_set = set(selected_pairs)
+    pair_outcomes: dict[tuple[int, int], PairOutcome] = {}
+    for pair, score in candidate_scores.items():
+        eligible = threshold is None or score >= threshold
+        if pair in selected_set:
+            pair_outcomes[pair] = "accepted"
+        elif eligible:
+            pair_outcomes[pair] = "assignment_conflict"
+        else:
+            pair_outcomes[pair] = "below_threshold"
+
+    candidate_detections = {detection_id for _, detection_id in candidate_scores}
+    eligible_detections = {
+        detection_id
+        for (_, detection_id), outcome in pair_outcomes.items()
+        if outcome != "below_threshold"
+    }
+    detection_outcomes: dict[int, DetectionOutcome] = {}
+    for detection_id in detection_ids:
+        if detection_id in accepted_detections:
+            outcome: DetectionOutcome = "accepted"
+        elif detection_id not in candidate_detections:
+            outcome = "no_candidate"
+        elif detection_id in eligible_detections:
+            outcome = "assignment_conflict"
+        else:
+            outcome = "confidence_rejection"
+        detection_outcomes[detection_id] = outcome
+    rejected_detection_ids = sorted(
+        detection_id
+        for detection_id, outcome in detection_outcomes.items()
+        if outcome == "confidence_rejection"
+    )
+    assignment_conflict_detection_ids = sorted(
+        detection_id
+        for detection_id, outcome in detection_outcomes.items()
+        if outcome == "assignment_conflict"
+    )
+    no_candidate_detection_ids = sorted(
+        detection_id
+        for detection_id, outcome in detection_outcomes.items()
+        if outcome == "no_candidate"
+    )
     return AssociationDecision(
         method=method,
         assignments=assignments,
         accepted=accepted,
         rejected=rejected,
+        rejected_detection_ids=rejected_detection_ids,
+        assignment_conflict_detection_ids=assignment_conflict_detection_ids,
+        no_candidate_detection_ids=no_candidate_detection_ids,
+        pair_outcomes=pair_outcomes,
+        detection_outcomes=detection_outcomes,
+        score_kind=("probability" if method == "calibrated_selective" else "association_score"),
         unmatched_detection_ids=sorted(set(detection_ids) - accepted_detections),
         unmatched_identity_ids=sorted(set(identity_ids) - accepted_identities),
         candidate_scores=candidate_scores,

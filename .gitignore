@@ -13,3 +13,4 @@ cache/
 features_cache/
 results/*
 !results/.gitkeep
+*.egg-info/

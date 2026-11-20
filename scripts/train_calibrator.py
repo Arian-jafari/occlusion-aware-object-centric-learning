@@ -95,6 +95,8 @@ def main() -> int:
             ),
             max_gap=int(config.memory["max_gap"]),
             appearance_history_size=int(config.memory["appearance_history_size"]),
+            memory_policy="cosine_threshold",
+            cosine_threshold=float(config.association["cosine_threshold"]),
         )
         calibrator = fit_logistic_calibrator(
             candidates,

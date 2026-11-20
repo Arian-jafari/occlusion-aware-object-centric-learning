@@ -1,5 +1,5 @@
 dataset:
-  root: /content/drive/MyDrive/DAVIS
+  root: ./data/DAVIS
   train_split: train
   validation_split: val
 
@@ -7,9 +7,9 @@ features:
   backbone: dinov2_vits14
   torch_hub_repository: facebookresearch/dinov2
   input_size: 518
-  batch_size: 4
-  cache_dir: /content/drive/MyDrive/occlusion_aware_association/cache/features
-  device: auto
+  batch_size: 2
+  cache_dir: ./data/cache/features
+  device: cuda
   use_mixed_precision: true
 
 memory:
@@ -29,13 +29,14 @@ association:
 
 calibration:
   model: logistic_regression
-  class_weight: balanced
+  class_weight: null
   max_iter: 1000
   random_state: 17
 
 evaluation:
   ece_bins: 10
   confidence_thresholds: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  tracking_confidence_thresholds: [0.3, 0.5, 0.7]  # Full-sequence validation replays; diagnostic only.
   memory_gaps: [5, 15, 30, 60]
 
 experiment:
@@ -43,5 +44,5 @@ experiment:
   smoke_test: false
   smoke_test_sequences: 2
   smoke_test_frames: 8
-  output_dir: /content/drive/MyDrive/occlusion_aware_association/results
+  output_dir: ./results
   overwrite: false
